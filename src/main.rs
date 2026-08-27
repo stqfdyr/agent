@@ -210,10 +210,18 @@ fn respawn_ping_tasks(
 }
 
 /// Connect time to a TCP port in milliseconds; -1 when unreachable.
+/// Round trip of a TCP handshake to the target.
+///
+/// The name is resolved before the clock starts. `TcpStream::connect` on a
+/// hostname resolves first and connects second, which folded the resolver's
+/// latency into every sample — on a domain target that was most of the number,
+/// and it is why these readings sat far above what komari reports for the same
+/// target (it resolves outside its own timer too).
 async fn tcp_ping(target: &str) -> i32 {
+    let Ok(mut addresses) = tokio::net::lookup_host(target).await else { return -1 };
+    let Some(address) = addresses.next() else { return -1 };
     let started = std::time::Instant::now();
-    let connect = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target)).await;
-    match connect {
+    match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await {
         Ok(Ok(_)) => started.elapsed().as_millis().min(i32::MAX as u128) as i32,
         _ => -1,
     }
