@@ -1,16 +1,27 @@
 [package]
 name = "monitor-agent"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Linux monitoring agent for the monitor hub"
+repository = "https://github.com/stqfdyr/agent"
 
 [dependencies]
-anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
-tracing.workspace = true
-tracing-subscriber.workspace = true
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# A single-threaded runtime is plenty: one report every couple of seconds plus
+# a handful of tcp probes, on someone else's VPS.
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1", features = ["fs"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

@@ -250,7 +250,8 @@ mod tests {
 
     #[test]
     fn ping_tasks_keep_their_timers_unless_the_task_changed() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Same flavour the binary runs on, so the test exercises the real thing.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
         let mut running = Vec::new();
