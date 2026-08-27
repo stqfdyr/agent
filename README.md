@@ -25,7 +25,7 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 手动运行：
 
 ```bash
-monitor-agent --server https://your-hub --token xxx [--interval 2] [--skip-iface wg]
+monitor-agent --server https://your-hub --token xxx [--interval 1]
 ```
 
 也可以用 `MONITOR_SERVER` / `MONITOR_TOKEN` 环境变量代替参数。
@@ -34,8 +34,7 @@ monitor-agent --server https://your-hub --token xxx [--interval 2] [--skip-iface
 |---|---|---|
 | `--server` | 必填 | hub 的地址 |
 | `--token` | 必填 | 面板里生成的节点 token |
-| `--interval` | 2 | 上报间隔（秒），1–3600 |
-| `--skip-iface` | — | 额外排除的网卡名前缀，可重复。默认已排除 lo/docker/veth/br-/virbr/tap/tun 等 |
+| `--interval` | 1 | 上报间隔（秒），1–3600。hub 生成的安装命令也默认传 1 |
 
 ## 上报什么
 

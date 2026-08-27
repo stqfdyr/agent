@@ -19,7 +19,6 @@ struct Args {
     server: String,
     token: String,
     interval: u64,
-    skip_ifaces: Vec<String>,
 }
 
 fn usage() -> ! {
@@ -29,30 +28,28 @@ fn usage() -> ! {
          Options:\n  \
            --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
            --token <token>      Node token from the hub panel\n  \
-           --interval <secs>    Report interval (default 2)\n  \
-           --skip-iface <name>  Extra interface prefix to exclude (repeatable)\n",
+           --interval <secs>    Report interval (default 1)\n",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut skip_ifaces) = (None, None, 2u64, Vec::new());
+    let (mut server, mut token, mut interval) = (None, None, 1u64);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
         match arg.as_str() {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
-            "--interval" => interval = value().parse().unwrap_or(2),
-            "--skip-iface" => skip_ifaces.push(value()),
+            "--interval" => interval = value().parse().unwrap_or(1),
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), skip_ifaces })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600) })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`.
@@ -114,7 +111,7 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
     let url = ws_url(&args.server)?;
-    let mut collector = Collector::new(args.skip_ifaces.clone());
+    let mut collector = Collector::new();
     let mut backoff = 1u64;
 
     loop {

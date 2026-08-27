@@ -97,7 +97,7 @@ busy% = (总增量 - idle 增量) / 总增量 * 100
 
 `net_rx_total` / `net_tx_total` 是**原样上报**的内核计数器，累加是 hub 的事，见 hub 仓库的 [traffic.md](https://github.com/stqfdyr/monitor/blob/main/docs/traffic.md)。
 
-网卡过滤：`SKIP_IFACES` 排除 lo、docker、veth、br-、virbr、tap、tun、cni 等前缀。`--skip-iface` 可以追加（比如你不想把 wireguard 的流量算进去）。
+网卡过滤：`SKIP_IFACES` 排除 lo、docker、veth、br-、virbr、tap、tun、cni 等前缀，写死在 `src/collect.rs`。
 
 ## 怎么验证
 

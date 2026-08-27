@@ -86,12 +86,11 @@ pub struct Collector {
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
     mounts: Vec<String>,
-    skip_ifaces: Vec<String>,
 }
 
 impl Collector {
-    pub fn new(extra_skip_ifaces: Vec<String>) -> Self {
-        Self { prev_cpu: None, prev_net: None, mounts: real_mount_points(), skip_ifaces: extra_skip_ifaces }
+    pub fn new() -> Self {
+        Self { prev_cpu: None, prev_net: None, mounts: real_mount_points() }
     }
 
     pub fn facts(&self) -> Facts {
@@ -118,7 +117,7 @@ impl Collector {
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
         let (disk_total, disk_used) = disk_usage(&self.mounts);
-        let (rx_total, tx_total) = net_totals(&self.skip_ifaces);
+        let (rx_total, tx_total) = net_totals();
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
 
@@ -254,17 +253,17 @@ fn uptime() -> u64 {
 }
 
 /// Sums the kernel's lifetime byte counters over real interfaces.
-fn net_totals(extra_skip: &[String]) -> (u64, u64) {
-    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default(), extra_skip)
+fn net_totals() -> (u64, u64) {
+    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
 }
 
-fn parse_net_dev(text: &str, extra_skip: &[String]) -> (u64, u64) {
+fn parse_net_dev(text: &str) -> (u64, u64) {
     let mut rx = 0u64;
     let mut tx = 0u64;
     for line in text.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else { continue };
         let name = name.trim();
-        if skip_iface(name, extra_skip) {
+        if skip_iface(name) {
             continue;
         }
         let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
@@ -276,8 +275,8 @@ fn parse_net_dev(text: &str, extra_skip: &[String]) -> (u64, u64) {
     (rx, tx)
 }
 
-fn skip_iface(name: &str, extra_skip: &[String]) -> bool {
-    SKIP_IFACES.iter().any(|p| name.starts_with(p)) || extra_skip.iter().any(|p| name.starts_with(p.as_str()))
+fn skip_iface(name: &str) -> bool {
+    SKIP_IFACES.iter().any(|p| name.starts_with(p))
 }
 
 /// Mount points backed by something real, deduplicated by source device so a
@@ -436,7 +435,7 @@ mod tests {
 
     #[test]
     fn cpu_percent_needs_a_baseline_then_uses_deltas() {
-        let mut c = Collector { prev_cpu: None, prev_net: None, mounts: vec![], skip_ifaces: vec![] };
+        let mut c = Collector { prev_cpu: None, prev_net: None, mounts: vec![] };
         c.prev_cpu = Some((1000, 900));
         // 100 more jiffies, 25 of them idle => 75% busy.
         let (total, idle) = parse_cpu_jiffies("cpu  40 0 35 925 0 0 0 0 0 0\n").unwrap();
@@ -453,13 +452,12 @@ mod tests {
                      lo: 9999 1 0 0 0 0 0 0 9999 2 0 0 0 0 0 0\n\
               docker0: 5555 1 0 0 0 0 0 0 5555 2 0 0 0 0 0 0\n\
                   wg0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n";
-        assert_eq!(parse_net_dev(dev, &[]), (1300, 2400));
-        assert_eq!(parse_net_dev(dev, &["wg".to_owned()]), (1000, 2000));
+        assert_eq!(parse_net_dev(dev), (1300, 2400));
     }
 
     #[test]
     fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
-        let mut c = Collector { prev_cpu: None, prev_net: None, mounts: vec![], skip_ifaces: vec![] };
+        let mut c = Collector { prev_cpu: None, prev_net: None, mounts: vec![] };
         let t0 = Instant::now();
         assert_eq!(c.net_rate(1000, 2000, t0), (0, 0));
         let t1 = t0 + std::time::Duration::from_secs(2);
@@ -492,7 +490,7 @@ mod tests {
 
     #[test]
     fn real_host_collection_is_sane() {
-        let mut c = Collector::new(vec![]);
+        let mut c = Collector::new();
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
         let m = c.collect();
@@ -508,7 +506,7 @@ mod crosscheck {
     /// Prints our numbers next to free(1)/df(1) so a human can eyeball the fix.
     #[test]
     fn print_against_free_and_df() {
-        let mut c = super::Collector::new(vec![]);
+        let mut c = super::Collector::new();
         let m = c.collect();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
         println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));
