@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Linux monitoring agent for the monitor hub"
@@ -17,6 +17,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1", features = ["fs"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# tokio-tungstenite 0.28 leaves the crypto provider to us: rustls only picks one
+# automatically when exactly one provider feature is on. Without this the agent
+# panics on its first wss:// connection, and plain ws:// never notices.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [profile.release]
