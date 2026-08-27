@@ -55,6 +55,10 @@ pub struct Facts {
     pub swap_total: u64,
     pub disk_total: u64,
     pub agent_version: String,
+    /// The box's own addresses. The hub only sees whichever family the agent
+    /// happened to connect over, and on a dual-stack box that is usually v6.
+    pub ipv4: String,
+    pub ipv6: String,
 }
 
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
@@ -94,6 +98,7 @@ impl Collector {
     }
 
     pub fn facts(&self) -> Facts {
+        let (v4, v6) = addresses();
         let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
         let (disk_total, _) = disk_usage(&self.mounts);
@@ -109,6 +114,8 @@ impl Collector {
             swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
             disk_total,
             agent_version: env!("CARGO_PKG_VERSION").into(),
+            ipv4: v4,
+            ipv6: v6,
         }
     }
 
@@ -250,6 +257,29 @@ fn uptime() -> u64 {
         .ok()
         .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok())
         .unwrap_or(0.0) as u64
+}
+
+/// The first real address of each family the kernel reports. On a VPS these
+/// are the public ones; behind NAT the v4 is private, which is the honest
+/// answer for what this machine actually holds — nothing is asked of any
+/// outside service.
+///
+/// Interfaces are filtered by the same prefix list that keeps virtual devices
+/// out of the traffic counters, so a docker bridge cannot be mistaken for the
+/// machine's address.
+fn addresses() -> (String, String) {
+    let (mut v4, mut v6) = (String::new(), String::new());
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if skip_iface(&iface.name) || iface.is_link_local() || !iface.is_oper_up() {
+            continue;
+        }
+        match iface.ip() {
+            std::net::IpAddr::V4(ip) if v4.is_empty() => v4 = ip.to_string(),
+            std::net::IpAddr::V6(ip) if v6.is_empty() => v6 = ip.to_string(),
+            _ => {}
+        }
+    }
+    (v4, v6)
 }
 
 /// Sums the kernel's lifetime byte counters over real interfaces.
@@ -493,6 +523,12 @@ mod tests {
         let mut c = Collector::new();
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
+        // Whatever this box has must parse; a virtual bridge must not win.
+        assert!(f.ipv4.is_empty() || f.ipv4.parse::<std::net::Ipv4Addr>().is_ok());
+        assert!(f.ipv6.is_empty() || f.ipv6.parse::<std::net::Ipv6Addr>().is_ok());
+        assert!(!f.ipv4.is_empty() || !f.ipv6.is_empty(), "a reachable box has at least one address");
+        // The prefix filter is the only thing keeping a docker bridge out.
+        assert!(!f.ipv4.starts_with("172.17."), "a virtual bridge is not this machine's address");
         let m = c.collect();
         assert!(!m.boot_id.is_empty(), "boot_id drives reboot detection");
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);

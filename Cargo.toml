@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Linux monitoring agent for the monitor hub"
@@ -22,6 +22,7 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 # panics on its first wss:// connection, and plain ws:// never notices.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+if-addrs = "0.15.0"
 
 [profile.release]
 codegen-units = 1
