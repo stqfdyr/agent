@@ -2,7 +2,7 @@
 
 mod collect;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -112,15 +112,31 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server)?;
     let mut collector = Collector::new();
-    let mut backoff = 1u64;
+    let mut wait = 0u64;
 
     loop {
-        match session(&url, &args.token, &mut collector, args.interval).await {
-            Ok(()) => backoff = 1,
-            Err(e) => warn!("session ended: {e:#}"),
+        let started = Instant::now();
+        if let Err(e) = session(&url, &args.token, &mut collector, args.interval).await {
+            warn!("session ended: {e:#}");
         }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(60);
+        wait = reconnect_wait(wait, started.elapsed());
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+/// How long to wait before reconnecting, from the previous wait and how long the
+/// session that just ended had lasted.
+///
+/// A session that reported for a while proves the hub is reachable and the token
+/// good, so whatever ended it was the hub restarting or the network blinking --
+/// that costs one second, not the minute a dead endpoint has earned. Only
+/// sessions that die young keep doubling, which is what keeps an agent off a hub
+/// stuck in a crash loop.
+fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
+    if lasted >= Duration::from_secs(30) {
+        1
+    } else {
+        (previous * 2).clamp(1, 60)
     }
 }
 
@@ -245,6 +261,22 @@ async fn tcp_ping(target: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
+        // Nothing on the other end: double until the ceiling and stay there.
+        let mut wait = 0;
+        let climb: Vec<u64> =
+            (0..8).map(|_| { wait = reconnect_wait(wait, Duration::from_secs(1)); wait }).collect();
+        assert_eq!(climb, [1, 2, 4, 8, 16, 32, 60, 60]);
+
+        // A session that actually ran starts over, however high the wait had
+        // climbed -- this is the hub-restart case, and 60s of blank panel was
+        // the bug.
+        assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
+        // Connected but dropped before it proved anything: still a retreat.
+        assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
 
     #[test]
     fn ws_url_upgrades_scheme_and_refuses_plaintext_to_remote() {
