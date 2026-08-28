@@ -542,25 +542,30 @@ mod tests {
         assert_eq!(c.net_rate(50, 60, t2), (0, 0));
     }
 
+    /// Two independent guards drop a mount: its filesystem type, and whether
+    /// its source looks like a device. Most junk trips both, which means either
+    /// one can be deleted without a row moving -- so the fixture carries a line
+    /// that only one of them catches.
     #[test]
     fn mounts_drop_pseudo_filesystems_and_duplicate_devices() {
         let mounts = parse_mounts(
             "/dev/vda1 / ext4 rw 0 0\n\
              proc /proc proc rw 0 0\n\
              tmpfs /run tmpfs rw 0 0\n\
+             /dev/loop0 /snap/core24/1 squashfs ro 0 0\n\
+             none /mnt/scratch ext4 rw 0 0\n\
              /dev/vda1 /var/lib/bind ext4 rw 0 0\n\
              overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0\n\
              /dev/vdb1 /data xfs rw 0 0\n\
              tank/set1 /tank zfs rw 0 0\n\
              tank/set2 /tank/sub zfs rw 0 0\n",
         );
+        // /snap/... is a real device holding a pseudo filesystem: only the
+        // fstype list rejects it, and a squashfs per snap would otherwise add a
+        // full copy of each one to the machine's disk total.
+        // /mnt/scratch is the mirror image -- a real filesystem whose source is
+        // not a path -- and only the device check rejects that.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
-    }
-
-    #[test]
-    fn disk_used_matches_df_on_this_machine() {
-        let (total, used) = disk_usage(&["/".to_owned()]);
-        assert!(total > 0 && used <= total);
     }
 
     #[test]
@@ -584,14 +589,62 @@ mod tests {
 
 #[cfg(test)]
 mod crosscheck {
-    /// Prints our numbers next to free(1)/df(1) so a human can eyeball the fix.
+    use super::*;
+
+    /// The first of the two rules, checked against the tools it names rather
+    /// than printed for a human to check. Constructed /proc text can only show
+    /// the arithmetic is right; it cannot show the right field was read, and
+    /// reading the wrong field is the bug this agent exists to fix.
+    ///
+    /// The tolerance covers the machine moving between the two readings, and it
+    /// is an order of magnitude below every wrong answer: on this box the root
+    /// reserve `df` excludes is gigabytes, and the page cache sysinfo counts as
+    /// used is gigabytes. Sixty-four mebibytes tells them apart with room over.
+    ///
+    /// Still prints, so `cargo test crosscheck -- --nocapture` reads the same.
     #[test]
-    fn print_against_free_and_df() {
-        let mut c = super::Collector::new();
+    fn memory_and_disk_agree_with_free_and_df_on_this_machine() {
+        let mut c = Collector::new();
         let m = c.collect();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
         println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));
         println!("disk used={:.2}G total={:.2}G", gib(m.disk_used), gib(m.disk_total));
         println!("net  rx_total={} tx_total={}", m.net_rx_total, m.net_tx_total);
+
+        const TOLERANCE: u64 = 64 * 1024 * 1024;
+        let close = |ours: u64, theirs: u64, what: &str| {
+            let drift = ours.abs_diff(theirs);
+            assert!(drift < TOLERANCE, "{what}: ours={ours} theirs={theirs} drift={drift}");
+        };
+
+        // free(1) row "Mem:": total, used, ... -- its used column is
+        // total - available, the same question MemAvailable answers.
+        let free = tool("free", &["-b"]);
+        let mut row = free.lines().nth(1).expect("free prints a Mem: row").split_whitespace().skip(1);
+        let parse = |v: Option<&str>| v.expect("free column").parse::<u64>().expect("a byte count");
+        assert_eq!(m.mem_total, parse(row.next()), "MemTotal is not free's total");
+        close(m.mem_used, parse(row.next()), "memory");
+
+        // df(1) counts the root reserve as free, which is f_bfree and not
+        // f_bavail. Compared against one filesystem, because df is being asked
+        // about one and the metric sums every mount.
+        let (disk_total, disk_used) = disk_usage(&["/".to_owned()]);
+        let df = tool("df", &["-B1", "--output=size,used", "/"]);
+        let mut row = df.lines().nth(1).expect("df prints a data row").split_whitespace();
+        let parse = |v: Option<&str>| v.expect("df column").parse::<u64>().expect("a byte count");
+        assert_eq!(disk_total, parse(row.next()), "f_blocks is not df's size");
+        close(disk_used, parse(row.next()), "disk");
+    }
+
+    /// Missing tools are a failure, not a reason to pass quietly: this test is
+    /// worth nothing if it can skip the comparison it exists for.
+    fn tool(program: &str, args: &[&str]) -> String {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap_or_else(|e| panic!("{program}(1) is what these numbers are checked against: {e}"));
+        assert!(out.status.success(), "{program} exited with {}", out.status);
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }

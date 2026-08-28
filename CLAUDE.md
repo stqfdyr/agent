@@ -19,13 +19,15 @@
 ## 工作方式
 
 - 用 `ponytail` skill（full），别过度设计、别过度测试。一段非平凡逻辑留一个能跑的检查就够
+- 断言要能被证伪：写完想一下**什么改动会让它变红**，想不出来就别写。铁律一的比对必须打真机，
+  构造数据证明不了读的是对的字段。验证手法见 hub 仓库 [development.md](https://github.com/stqfdyr/monitor/blob/main/docs/development.md) 的「变异检查」
 - `Metrics` / `Facts` struct 就是线上协议的权威定义，别再写一份字段列表去同步
 - 改了上报字段就是改了协议，hub 那边要同步
 
 ## 常用命令
 
 ```bash
-cargo test                # 12 个
+cargo test                # 14 个
 cargo clippy --all-targets
-cargo test crosscheck -- --nocapture   # 打印采集值，和 free / df 对照
+cargo test crosscheck -- --nocapture   # 采集值与 free / df 自动比对，顺带打印
 ```

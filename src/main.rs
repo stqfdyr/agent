@@ -296,8 +296,16 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        // A loopback handshake finishes inside a millisecond, so the reading
+        // here is 0 whether it is timed or not. What this pins is the contract
+        // either side of it -- reachable is non-negative, unreachable is -1.
+        // That the number is a real round trip rests on the deadline below and
+        // on the controlled experiment in docs/data-accuracy.md.
         assert!(tcp_ping(&addr.to_string()).await >= 0);
-        assert_eq!(tcp_ping("127.0.0.1:1").await, -1);
+        assert_eq!(tcp_ping("127.0.0.1:1").await, -1, "nothing is listening there");
+        // A target the hub sent that will not even resolve must come back as
+        // unreachable rather than take the probe down.
+        assert_eq!(tcp_ping("127.0.0.1:99999").await, -1, "not a parseable target");
     }
 
     /// The deadline is the whole mechanism: it has to land under the kernel's
@@ -324,7 +332,7 @@ mod tests {
 
         respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
         assert_eq!(running.len(), 2);
-        let first = running[0].1.id();
+        let (first, second) = (running[0].1.id(), running[1].1.id());
 
         // Task 1 unchanged, task 2 retargeted, task 3 added.
         respawn_ping_tasks(
@@ -334,5 +342,15 @@ mod tests {
         );
         assert_eq!(running.len(), 3);
         assert_eq!(running[0].1.id(), first, "unchanged task must not be restarted");
+        // The other half of the same rule: a task whose target moved has to be
+        // torn down, or it goes on probing the old address forever.
+        assert_ne!(running[1].1.id(), second, "a retargeted task must be restarted");
+
+        // A hub that sends interval 0 must not take the probe down with it.
+        // tokio's interval panics on a zero period, and a panicked task is a
+        // probe that stops reporting without ever saying so.
+        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert!(!running[0].1.is_finished(), "a zero interval must be clamped, not panic the probe");
     }
 }

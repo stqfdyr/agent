@@ -100,7 +100,9 @@ used  = (f_blocks - f_bfree) * f_frsize    // f_bfree 是原始空闲块，含�
 
 不去重的话，一台有 bind mount 的机器硬盘容量会翻倍。
 
-测试：`mounts_drop_pseudo_filesystems_and_duplicate_devices`。
+测试：`mounts_drop_pseudo_filesystems_and_duplicate_devices`。它的样本里刻意留了两行只被其中
+一道检查挡住的挂载（`/dev/loop0 … squashfs` 只有 fstype 名单拦得住，`none … ext4` 只有设备名
+检查拦得住）——不然两道检查互为备份，删掉任何一道测试都照样绿。
 
 挂载表**每次采样都重读**，不在启动时缓存：agent 起来之后加挂的数据盘，否则要等到重启 agent
 才会出现在容量里。`/proc/self/mounts` 只有几 KB，比后面那次 `statvfs` 便宜。
@@ -185,15 +187,21 @@ komari 的做法是读数超过 1000 ms 就重测最多 3 次，若重测明显�
 
 ## 怎么验证
 
-`collect.rs` 里有个 `crosscheck` 测试模块专门干这个：
+`collect.rs` 里的 `crosscheck` 测试模块自己去跑 `free` 和 `df` 并比对，不用人工核对：
 
 ```bash
-cargo test -p monitor-agent crosscheck -- --nocapture
-free -b  | awk 'NR==2{printf "free used=%.2fG total=%.2fG\n", $3/1073741824, $2/1073741824}'
-df -B1 --output=size,used / | tail -1
+cargo test crosscheck -- --nocapture     # 仍然打印，同时会断言
 ```
 
-**硬盘必须逐字节相同。内存允许几十 MB 的差异**（两次采样之间机器还在跑）。差到几百 MB 或几个 GB 就是口径错了。
+容差 64 MiB，留给两次取值之间机器自己的变化。它比任何一种错口径都小一个数量级——本机上
+`df` 排除的 root 预留是 3.2 GiB，sysinfo 会记成已用的 page cache 是 2.4 GiB，htop 公式的偏差
+288 MiB，全都远在容差之外。差到几百 MB 就是口径错了，不是抖动。
+
+**这个比对必须打真机**：构造一段 `/proc/meminfo` 文本只能证明算术没写错，证明不了读的是对的
+字段——而读错字段正是这个 agent 要修的原始 bug。用 `f_bavail` 代替 `f_bfree` 在构造数据上
+一样能算出自洽的结果，只有跟 `df` 一比才露馅。
+
+系统上没有 `free` 或 `df` 时测试**失败**，不是跳过：一个可以静默跳过比对的测试等于没有。
 
 最近一次实机对照（Debian 12，3.8 GiB 内存，59 GiB 盘）：
 
