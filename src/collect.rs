@@ -86,22 +86,22 @@ pub struct Metrics {
     pub procs: u32,
 }
 
+#[derive(Default)]
 pub struct Collector {
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
-    mounts: Vec<String>,
 }
 
 impl Collector {
     pub fn new() -> Self {
-        Self { prev_cpu: None, prev_net: None, mounts: real_mount_points() }
+        Self::default()
     }
 
     pub fn facts(&self) -> Facts {
         let (v4, v6) = addresses();
         let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&self.mounts);
+        let (disk_total, _) = disk_usage(&real_mount_points());
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -123,7 +123,7 @@ impl Collector {
         let mem = meminfo();
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
-        let (disk_total, disk_used) = disk_usage(&self.mounts);
+        let (disk_total, disk_used) = disk_usage(&real_mount_points());
         let (rx_total, tx_total) = net_totals();
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
@@ -241,8 +241,10 @@ fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
     if v.len() < 5 {
         return None;
     }
-    // idle + iowait are both time the CPU was not doing work.
-    Some((v.iter().sum(), v[3] + v[4]))
+    // idle + iowait are both time the CPU was not doing work. guest and
+    // guest_nice are already counted inside user and nice, so the sum stops
+    // before them rather than charging that time twice.
+    Some((v.iter().take(8).sum(), v[3] + v[4]))
 }
 
 fn loadavg() -> [f32; 3] {
@@ -311,6 +313,10 @@ fn skip_iface(name: &str) -> bool {
 
 /// Mount points backed by something real, deduplicated by source device so a
 /// bind mount or a second subvolume cannot double-count the same disk.
+///
+/// Re-read on every sample rather than cached at startup: a disk attached
+/// later would otherwise stay invisible until the agent was restarted, and
+/// /proc/self/mounts is a few kilobytes.
 fn real_mount_points() -> Vec<String> {
     parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
 }
@@ -356,15 +362,36 @@ fn disk_usage(mounts: &[String]) -> (u64, u64) {
     (total, used)
 }
 
+/// Socket counts from /proc/net/sockstat, which is a handful of short lines.
+/// Counting lines in /proc/net/tcp meant reading and parsing the entire
+/// connection table once a second — hundreds of kilobytes on a busy box, for
+/// a number the kernel already keeps. TIME_WAIT sockets live in the v4 `tw`
+/// counter for both families, so they are added once.
 fn conn_counts() -> (u32, u32) {
-    let count = |paths: [&str; 2]| {
-        paths
-            .iter()
-            .filter_map(|p| fs::read_to_string(p).ok())
-            .map(|t| t.lines().count().saturating_sub(1) as u32)
-            .sum()
+    parse_sockstat(
+        &fs::read_to_string("/proc/net/sockstat").unwrap_or_default(),
+        &fs::read_to_string("/proc/net/sockstat6").unwrap_or_default(),
+    )
+}
+
+fn parse_sockstat(v4: &str, v6: &str) -> (u32, u32) {
+    let stat = |text: &str, prefix: &str, key: &str| {
+        text.lines()
+            .find_map(|line| {
+                let mut fields = line.strip_prefix(prefix)?.split_whitespace();
+                while let Some(word) = fields.next() {
+                    if word == key {
+                        return fields.next()?.parse::<u32>().ok();
+                    }
+                }
+                None
+            })
+            .unwrap_or(0)
     };
-    (count(["/proc/net/tcp", "/proc/net/tcp6"]), count(["/proc/net/udp", "/proc/net/udp6"]))
+    (
+        stat(v4, "TCP:", "inuse") + stat(v4, "TCP:", "tw") + stat(v6, "TCP6:", "inuse"),
+        stat(v4, "UDP:", "inuse") + stat(v6, "UDP6:", "inuse"),
+    )
 }
 
 fn proc_count() -> u32 {
@@ -465,14 +492,32 @@ mod tests {
 
     #[test]
     fn cpu_percent_needs_a_baseline_then_uses_deltas() {
-        let mut c = Collector { prev_cpu: None, prev_net: None, mounts: vec![] };
-        c.prev_cpu = Some((1000, 900));
-        // 100 more jiffies, 25 of them idle => 75% busy.
-        let (total, idle) = parse_cpu_jiffies("cpu  40 0 35 925 0 0 0 0 0 0\n").unwrap();
-        assert_eq!((total, idle), (1000, 925));
-        let (t2, i2) = parse_cpu_jiffies("cpu  115 0 35 950 0 0 0 0 0 0\n").unwrap();
-        assert_eq!((t2, i2), (1100, 950));
+        assert_eq!(parse_cpu_jiffies("cpu  40 0 35 925 0 0 0 0 0 0\n"), Some((1000, 925)));
+        // The last two columns are guest and guest_nice, which the kernel has
+        // already counted inside user and nice: 80 busy jiffies, not 1080.
+        assert_eq!(parse_cpu_jiffies("cpu  10 10 10 10 10 10 10 10 500 500\n"), Some((80, 20)));
         assert!(parse_cpu_jiffies("garbage").is_none());
+
+        // 100 more jiffies since the baseline, 25 of them idle => 75% busy.
+        let mut c = Collector::new();
+        c.prev_cpu = Some((1000, 925));
+        let busy = |(total, idle): (u64, u64), prev: (u64, u64)| {
+            let dt = (total - prev.0) as f32;
+            ((dt - (idle - prev.1) as f32) / dt * 100.0).clamp(0.0, 100.0)
+        };
+        assert_eq!(busy((1100, 950), c.prev_cpu.unwrap()), 75.0);
+        // A live box has no baseline on the first call, so it reports 0.
+        assert_eq!(Collector::new().cpu_percent(), 0.0);
+    }
+
+    #[test]
+    fn socket_counts_come_from_sockstat_not_the_connection_table() {
+        let v4 = "sockets: used 226\nTCP: inuse 78 orphan 1 tw 7 alloc 85 mem 119\nUDP: inuse 2 mem 150\n";
+        let v6 = "TCP6: inuse 1\nUDP6: inuse 4\n";
+        // Matches what counting lines in /proc/net/tcp{,6} reported on this box:
+        // TIME_WAIT sockets are held in the v4 `tw` field for both families.
+        assert_eq!(parse_sockstat(v4, v6), (86, 6));
+        assert_eq!(parse_sockstat("", ""), (0, 0));
     }
 
     #[test]
@@ -487,7 +532,7 @@ mod tests {
 
     #[test]
     fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
-        let mut c = Collector { prev_cpu: None, prev_net: None, mounts: vec![] };
+        let mut c = Collector::new();
         let t0 = Instant::now();
         assert_eq!(c.net_rate(1000, 2000, t0), (0, 0));
         let t1 = t0 + std::time::Duration::from_secs(2);

@@ -77,6 +77,9 @@ used  = (f_blocks - f_bfree) * f_frsize    // f_bfree 是原始空闲块，含�
 
 测试：`mounts_drop_pseudo_filesystems_and_duplicate_devices`。
 
+挂载表**每次采样都重读**，不在启动时缓存：agent 起来之后加挂的数据盘，否则要等到重启 agent
+才会出现在容量里。`/proc/self/mounts` 只有几 KB，比后面那次 `statvfs` 便宜。
+
 ## CPU
 
 读 `/proc/stat` 第一行的 jiffies，算**两次采样之间的差值**：
@@ -87,7 +90,21 @@ busy% = (总增量 - idle 增量) / 总增量 * 100
 
 `idle` 取 `idle + iowait` 两项之和（都是 CPU 没在干活的时间）。
 
+总量只累加**前 8 个字段**（user 到 steal）。最后两个 `guest` / `guest_nice` 是内核已经计进
+user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的宿主机的 CPU 占用算低。
+
 **第一次采集返回 0**，因为没有基线。返回自开机以来的平均值会是个毫无意义的数字。
+
+## 连接数
+
+`tcp` / `udp` 来自 `/proc/net/sockstat` 和 `sockstat6`，各取一个 `inuse`，TCP 再加上 v4 那行的
+`tw`（TIME_WAIT 的套接字两个协议族共用这一个计数器）。
+
+原来的做法是数 `/proc/net/tcp{,6}` 的行数：结果一样，但要内核把整张连接表格式化成文本、agent
+再逐行数一遍——一台几千连接的机器上就是每秒读几百 KB，只为得到一个内核本来就在数的整数。
+
+测试：`socket_counts_come_from_sockstat_not_the_connection_table`，用的是真机上两种算法都得出
+86 的那组数据。
 
 ## 网络速率
 
