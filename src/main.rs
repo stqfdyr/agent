@@ -22,9 +22,6 @@ struct Args {
 }
 
 fn usage() -> ! {
-    // The first line is load-bearing: the hub's install.sh writes an updater
-    // that runs `--help` on a freshly downloaded binary and refuses to install
-    // it unless this line comes back. Keep the "monitor-agent <version>" shape.
     eprintln!(
         "monitor-agent {}\n\n\
          Usage: monitor-agent --server <url> --token <token> [options]\n\n\
