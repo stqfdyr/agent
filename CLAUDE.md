@@ -11,7 +11,7 @@
 
 不要"顺手"加回来，想加先问用户：
 
-- **自动更新**（升级方式是重跑安装命令，一行的事；自更新意味着 agent 能以 root 下载执行任意二进制）
+- **自更新**（agent 进程不碰自己的二进制。它跑在 `DynamicUser` + `ProtectSystem=strict` 下面，本来也写不了；要自更新就得把这些全撤掉，等于给一个长期在线、解析外来帧的进程 root 写权限。更新由 hub 的 `install.sh` 装的 root 定时器做，见 [hub 的 decisions.md](https://github.com/stqfdyr/monitor/blob/main/docs/decisions.md)）
 - **跨平台**（Windows / macOS / BSD）——只支持 Linux 是刻意的，直接读 `/proc` 才能修好那几个口径问题。加跨平台等于推翻整个 `collect.rs`
 - ICMP / HTTP ping（只保留 TCP）
 - 远程命令执行、terminal
