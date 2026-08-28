@@ -15,7 +15,7 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -24,19 +24,21 @@ jobs:
       # install.sh downloads exactly this name; changing it breaks every
       # install command the hub hands out.
       - run: cp "target/${{ matrix.target }}/release/monitor-agent" "monitor-agent-${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: monitor-agent-${{ matrix.target }}
 
   release:
     needs: build
+    # A manual dispatch builds but publishes nothing; only a tag makes a release.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: monitor-agent-*
-          generate_release_notes: true
+      # gh ships on the runner, so the release path carries no third-party action.
+      - run: gh release create "$GITHUB_REF_NAME" monitor-agent-* --generate-notes --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
