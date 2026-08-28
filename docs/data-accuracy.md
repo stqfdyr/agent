@@ -30,10 +30,35 @@ htop / komari 用的是：
 used = MemTotal - (MemFree + Buffers + Cached + SReclaimable) + Shmem
 ```
 
-在实机上这个值比 `free` 少约 0.25 GB（差在 `MemAvailable` 对 slab 可回收部分的保守估计）。两个都"对"，但：
+komari 在 Linux 上默认走的就是这条（`monitoring/unit/mem.go` 的 `GetMemHtopLike`），所以同一台机器
+两个面板的数字对不上。在 cc 上同一时刻取值：
 
+```
+MemTotal 468400  MemFree 38124  MemAvailable 353608
+Buffers 57820  Cached 217888  SReclaimable 54440  Shmem 2620   (kB)
+
+本项目    total - MemAvailable                              = 112.1 MiB
+komari    total - (free+cached+sreclaimable+buffers) + shmem = 100.4 MiB
+差         11.7 MiB
+```
+
+差额拆开来是两笔：内核认为**收不回来**的那部分 cache（14.3 MiB），减去 htop 额外计入的 `Shmem`
+（2.6 MiB，共享内存确实占着物理页，这一笔 htop 算得对）。
+
+**两个公式回答的不是同一个问题。** htop 那条假设 cache、buffer、可回收 slab 全都能收回来，答的是
+「进程大概占了多少」；内核比谁都清楚其中有一部分（脏页、被 mlock 的、正在映射的）收不回来，
+`MemAvailable` 已经把它们扣掉了，答的是「还剩多少能用」。
+
+面板上那根内存条要回答的是后者，所以用 `MemAvailable`：
+
+- 它是内核的判断，不是用户态的假设；htop 公式会**系统性低估**内存压力，而且越是内存吃紧、cache 越少，
+  两者差得越多——恰恰在最需要准的时候最不准
 - 用户对照的是 `free -h`，不是 htop
 - 一行减法 vs 五个字段的公式，前者更难写错
+
+其余指标和 komari 是一致的：同一时刻硬盘 3.00/29.42 GiB、进程数 71、UDP 5、uptime 全部相同。
+TCP 连接数两边会差几个，因为 TIME_WAIT 每秒都在变——我们的读数与内核同一时刻的 sockstat
+（`inuse 8 + tw 8 + TCP6 inuse 3 = 19`）和 `/proc/net/tcp` 行数（19）三方吻合。
 
 原本第一版实现的就是 htop 公式，实机对照后换掉了。commit `8fa5ab8` 之后的修改。
 
@@ -115,6 +140,48 @@ user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的
 `net_rx_total` / `net_tx_total` 是**原样上报**的内核计数器，累加是 hub 的事，见 hub 仓库的 [traffic.md](https://github.com/stqfdyr/monitor/blob/main/docs/traffic.md)。
 
 网卡过滤：`SKIP_IFACES` 排除 lo、docker、veth、br-、virbr、tap、tun、cni 等前缀，写死在 `src/collect.rs`。
+
+## 网络延迟
+
+`tcp_ping()` 量的是一次 TCP 握手的往返，单位毫秒；测不到就是 `-1`。域名在计时开始**之前**解析，
+所以 DNS 不进读数（komari 的 `net.DialTimeout` 把域名直接交给内核，解析时间是算进去的）。
+
+### 超时为什么是 900 毫秒
+
+**因为 Linux 的首个 SYN 重传定时器是 1 秒。** 等得比它久，丢掉的 SYN 就不会失败——它会「迟到地
+成功」，而 `connect` 交回来的是重传定时器加上往返，不是往返。那不是慢，是另一种测量披着毫秒的皮。
+
+生产库里 3721 个样本，异常值的分布把这件事说得很白：
+
+```
+   0– 500 ms : 3559 个   ← 正常往返，中位数 195
+ 500– 900 ms :    0 个   ← 空的
+1100–1299 ms :  104 个   ← 1000 ms 首次重传 + 200 ms 往返
+3200–3299 ms :   57 个   ← 1000+2000 ms 两次重传 + 往返
+```
+
+中间那段空白就是证据：连续的网络抖动不会留下空隙，离散的内核定时器才会。
+
+把超时压到重传之前，回来的读数就只可能属于「第一个 SYN 就成功」的握手，也就必然是真往返；丢了的
+那次变成 `-1`，而它本来就是丢包。代价是真往返超过 900 毫秒的链路会被报成不可达——到那个份上它对任何
+用途来说也确实是。
+
+受控实验（环回口注入 50% SYN 丢包，真实往返 0 ms）：
+
+| 超时 | 成功 | 成功读数中位 | ≥900 ms 的假读数 |
+|---|---|---|---|
+| 5 秒（旧） | 26/30 | **1010 ms** | 14 个 |
+| 0.9 秒（新） | 10/30 | **0 ms** | 0 个 |
+
+旧超时在一条零延迟的链路上报出 1010 毫秒，新超时报出真值和丢包。
+
+### 和 komari 的差别
+
+komari 的做法是读数超过 1000 ms 就重测最多 3 次，若重测明显变快（差值 > 800 ms）就判定发生过重传，
+把这次记为失败（`server/task.go` 的 `NewPingTask`）。结论和我们一致——重传期间的数字不能当延迟用——
+但要为此多花最多 3 次握手，而且重测测的是「后来那一刻」，已经不是原本要问的那一刻。
+
+截断超时拿到同样的结果，不额外发一个包，逻辑就是一个常量。
 
 ## 怎么验证
 

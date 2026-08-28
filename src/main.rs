@@ -209,8 +209,23 @@ fn respawn_ping_tasks(
     }
 }
 
-/// Connect time to a TCP port in milliseconds; -1 when unreachable.
-/// Round trip of a TCP handshake to the target.
+/// Deadline for one handshake, deliberately under the kernel's first SYN
+/// retransmit.
+///
+/// Linux arms its initial SYN timer at one second. Wait longer than that and a
+/// dropped SYN does not fail — it succeeds late, and `connect` hands back the
+/// retransmit timer plus the round trip instead of the round trip. Those are
+/// not slow pings, they are a different measurement wearing the same units.
+///
+/// Cutting the wait short means a reading that comes back always belongs to a
+/// handshake that completed on the first SYN, so it is a real round trip; a
+/// dropped one becomes -1, which is what it actually was. The cost is that a
+/// link whose genuine round trip exceeds this is reported unreachable — at
+/// which point it is, for anything anyone would use it for.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(900);
+
+/// Round trip of a TCP handshake to the target, in milliseconds; -1 when the
+/// SYN went unanswered inside [`HANDSHAKE_DEADLINE`].
 ///
 /// The name is resolved before the clock starts. `TcpStream::connect` on a
 /// hostname resolves first and connects second, which folded the resolver's
@@ -221,7 +236,7 @@ async fn tcp_ping(target: &str) -> i32 {
     let Ok(mut addresses) = tokio::net::lookup_host(target).await else { return -1 };
     let Some(address) = addresses.next() else { return -1 };
     let started = std::time::Instant::now();
-    match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await {
+    match tokio::time::timeout(HANDSHAKE_DEADLINE, TcpStream::connect(address)).await {
         Ok(Ok(_)) => started.elapsed().as_millis().min(i32::MAX as u128) as i32,
         _ => -1,
     }
@@ -251,6 +266,19 @@ mod tests {
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
         assert!(tcp_ping(&addr.to_string()).await >= 0);
         assert_eq!(tcp_ping("127.0.0.1:1").await, -1);
+    }
+
+    /// The deadline is the whole mechanism: it has to land under the kernel's
+    /// first SYN retransmit, or a dropped SYN comes back as a ~1200ms "latency"
+    /// that is really the 1s timer plus the round trip. A production database
+    /// had 161 such readings, every one of them in a 1200ms or 3200ms cluster
+    /// with nothing in between — the signature of a retransmit, not a slow link.
+    #[test]
+    fn the_handshake_deadline_stays_under_the_kernels_syn_timer() {
+        assert!(
+            HANDSHAKE_DEADLINE < Duration::from_secs(1),
+            "a deadline at or past the 1s initial RTO lets retransmits be reported as latency"
+        );
     }
 
     #[test]
