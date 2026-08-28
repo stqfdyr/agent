@@ -140,13 +140,30 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
     }
 }
 
+/// Deadline for getting a connection up, covering all three stages of it.
+///
+/// Only the TCP handshake has a deadline of its own; the TLS exchange and the
+/// HTTP upgrade have none. A peer that accepts the connection and then says
+/// nothing — a half-open socket left behind a tunnel, a stalled edge — leaves
+/// `connect_async` awaiting forever, and with it an agent that is still running
+/// and has stopped reporting, with nothing in its log to say so. The reconnect
+/// loop below can only recover from a connect that comes back.
+///
+/// Generous on purpose: a healthy connect here takes a quarter of a second, and
+/// the slowest real one measured was a tunnel re-establishing for sixty. This
+/// is not a latency budget, it is the line past which nothing is coming.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+
 /// One connection: say hello, then report until the socket dies.
 async fn session(url: &str, token: &str, collector: &mut Collector, interval: u64) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
-    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.context("connect")?;
+    let (mut ws, _) = tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(request))
+        .await
+        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))?
+        .context("connect")?;
     info!("connected");
 
     ws.send(notify("hello", serde_json::to_value(collector.facts())?)).await?;
