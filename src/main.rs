@@ -283,8 +283,12 @@ mod tests {
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
         // Nothing on the other end: double until the ceiling and stay there.
         let mut wait = 0;
-        let climb: Vec<u64> =
-            (0..8).map(|_| { wait = reconnect_wait(wait, Duration::from_secs(1)); wait }).collect();
+        let climb: Vec<u64> = (0..8)
+            .map(|_| {
+                wait = reconnect_wait(wait, Duration::from_secs(1));
+                wait
+            })
+            .collect();
         assert_eq!(climb, [1, 2, 4, 8, 16, 32, 60, 60]);
 
         // A session that actually ran starts over, however high the wait had
