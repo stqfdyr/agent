@@ -355,9 +355,9 @@ fn parse_mounts(text: &str) -> Vec<String> {
     out
 }
 
-/// `used = total - free`, exactly what df reports. Scout used
-/// `total - available`, which charges ext4's 5% root reserve to the user and
-/// shows a fresh disk as several percent full.
+/// `used = total - free`, exactly what df reports. The obvious alternative,
+/// `total - available`, charges ext4's 5% root reserve to the user and shows a
+/// freshly formatted disk as several percent full.
 fn disk_usage(mounts: &[String]) -> (u64, u64) {
     let mut total = 0u64;
     let mut used = 0u64;

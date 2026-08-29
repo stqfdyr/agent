@@ -1,14 +1,17 @@
 # 数据口径
 
-Scout 的内存和硬盘数字不对，这是迁到 monitor 要修的原始 bug 之一。改 `agent/src/collect.rs` 之前请读完这篇。
+内存和硬盘是这个 agent 最容易报错、报错了又最不容易被发现的两个数——它们永远会给出一个看着挺
+合理的数字。改 `src/collect.rs` 之前请读完这篇。
 
 **验收标准很硬：面板上的数字必须和目标机器上 `free` / `df` 的输出对得上。**
 
 ## 内存
 
-### 错在哪
+### 现成的写法错在哪
 
-Scout 用的是 `sysinfo` 的 `used_memory()`。sysinfo 把 **page cache 算成已用内存**。Linux 会拿所有空闲内存做磁盘缓存，所以一台开机跑了几天的机器，cache 通常有好几个 GB——面板上就显示成内存快满了，实际上完全没有压力。
+最省事的做法是 `sysinfo` 的 `used_memory()`，而它把 **page cache 算成已用内存**。Linux 会拿所有
+空闲内存做磁盘缓存，所以一台开机跑了几天的机器，cache 通常有好几个 GB——面板上就显示成内存快满了，
+实际上完全没有压力。
 
 ### 现在怎么算
 
@@ -24,22 +27,21 @@ used = MemTotal - MemAvailable
 
 ### 为什么不用 htop 的公式
 
-htop / komari 用的是：
+另一条广泛使用的算法是 htop 的：
 
 ```
 used = MemTotal - (MemFree + Buffers + Cached + SReclaimable) + Shmem
 ```
 
-komari 在 Linux 上默认走的就是这条（`monitoring/unit/mem.go` 的 `GetMemHtopLike`），所以同一台机器
-两个面板的数字对不上。在 cc 上同一时刻取值：
+两条公式在同一台机器上给出的数字不一样。在 cc 上同一时刻取值：
 
 ```
 MemTotal 468400  MemFree 38124  MemAvailable 353608
 Buffers 57820  Cached 217888  SReclaimable 54440  Shmem 2620   (kB)
 
-本项目    total - MemAvailable                              = 112.1 MiB
-komari    total - (free+cached+sreclaimable+buffers) + shmem = 100.4 MiB
-差         11.7 MiB
+本项目   total - MemAvailable                              = 112.1 MiB
+htop     total - (free+cached+sreclaimable+buffers) + shmem = 100.4 MiB
+差        11.7 MiB
 ```
 
 差额拆开来是两笔：内核认为**收不回来**的那部分 cache（14.3 MiB），减去 htop 额外计入的 `Shmem`
@@ -56,9 +58,9 @@ komari    total - (free+cached+sreclaimable+buffers) + shmem = 100.4 MiB
 - 用户对照的是 `free -h`，不是 htop
 - 一行减法 vs 五个字段的公式，前者更难写错
 
-其余指标和 komari 是一致的：同一时刻硬盘 3.00/29.42 GiB、进程数 71、UDP 5、uptime 全部相同。
-TCP 连接数两边会差几个，因为 TIME_WAIT 每秒都在变——我们的读数与内核同一时刻的 sockstat
-（`inuse 8 + tw 8 + TCP6 inuse 3 = 19`）和 `/proc/net/tcp` 行数（19）三方吻合。
+内存是唯一有这种分歧的指标。硬盘、进程数、UDP、uptime 都只有一个读法，读的就是内核给的那个数。
+TCP 连接数看着会跳，那是 TIME_WAIT 每秒都在变，不是口径问题——同一时刻 sockstat
+（`inuse 8 + tw 8 + TCP6 inuse 3 = 19`）和 `/proc/net/tcp` 的行数（19）是对得上的。
 
 原本第一版实现的就是 htop 公式，实机对照后换掉了。commit `8fa5ab8` 之后的修改。
 
@@ -72,9 +74,9 @@ used = SwapTotal - SwapFree - SwapCached
 
 ## 硬盘
 
-### 错在哪
+### 现成的写法错在哪
 
-Scout 用 `total_space - available_space`。
+最直觉的写法是 `total_space - available_space`（`sysinfo` 给的也是这一对）。
 
 ext4 默认给 root 预留 5% 的块（`tune2fs -m`）。这部分块普通用户用不了，所以不计入 `available`，但它们**也没被使用**。用 `total - available` 就等于把这 5% 记成已用——一块刚格式化的 100 GB 盘会显示已用 5 GB。
 
@@ -146,7 +148,8 @@ user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的
 ## 网络延迟
 
 `tcp_ping()` 量的是一次 TCP 握手的往返，单位毫秒；测不到就是 `-1`。域名在计时开始**之前**解析，
-所以 DNS 不进读数（komari 的 `net.DialTimeout` 把域名直接交给内核，解析时间是算进去的）。
+所以 DNS 不进读数——把域名直接交给 `TcpStream::connect` 是解析和连接一起做的，域名目标上解析
+往往就是读数的大头。
 
 ### 超时为什么是 900 毫秒
 
@@ -177,11 +180,11 @@ user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的
 
 旧超时在一条零延迟的链路上报出 1010 毫秒，新超时报出真值和丢包。
 
-### 和 komari 的差别
+### 否决过的做法：超时之后重测
 
-komari 的做法是读数超过 1000 ms 就重测最多 3 次，若重测明显变快（差值 > 800 ms）就判定发生过重传，
-把这次记为失败（`server/task.go` 的 `NewPingTask`）。结论和我们一致——重传期间的数字不能当延迟用——
-但要为此多花最多 3 次握手，而且重测测的是「后来那一刻」，已经不是原本要问的那一刻。
+另一条路是把超时留得很宽，读数超过 1000 ms 时重测几次，若重测明显变快（差值 > 800 ms）就判定
+中间发生过重传，把这次记为失败。结论会和现在一致——重传期间的数字不能当延迟用——但代价是每个可疑
+样本多花最多 3 次握手，而且重测测的是「后来那一刻」，已经不是原本要问的那一刻。
 
 截断超时拿到同样的结果，不额外发一个包，逻辑就是一个常量。
 

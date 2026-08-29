@@ -4,7 +4,7 @@
 
 ## 两条铁律
 
-1. **数字必须和 `free` / `df` 对得上。** 这是这个 agent 存在的理由之一——参考实现（sysinfo、komari）在内存和硬盘上口径是错的。改采集代码前读 [docs/data-accuracy.md](docs/data-accuracy.md)
+1. **数字必须和 `free` / `df` 对得上。** 这是这个 agent 存在的理由之一——内存和硬盘的现成写法（`sysinfo` 那对 API、htop 的公式）口径都不对，而且错得看不出来。改采集代码前读 [docs/data-accuracy.md](docs/data-accuracy.md)
 2. **agent 保持无状态。** 不写文件、不记忆跨重启的状态。它只上报"此刻内核说的数字"，累加是 hub 的事。往这里加持久化之前先问用户
 
 ## 明确不做的

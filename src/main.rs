@@ -263,8 +263,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(900);
 /// The name is resolved before the clock starts. `TcpStream::connect` on a
 /// hostname resolves first and connects second, which folded the resolver's
 /// latency into every sample — on a domain target that was most of the number,
-/// and it is why these readings sat far above what komari reports for the same
-/// target (it resolves outside its own timer too).
+/// and it is what made these readings sit far above what the link deserved.
 async fn tcp_ping(target: &str) -> i32 {
     let Ok(mut addresses) = tokio::net::lookup_host(target).await else { return -1 };
     let Some(address) = addresses.next() else { return -1 };
