@@ -311,6 +311,14 @@ fn skip_iface(name: &str) -> bool {
     SKIP_IFACES.iter().any(|p| name.starts_with(p))
 }
 
+/// A pseudo filesystem, either named outright or as a flavour of one the list
+/// holds — `fuse.lxcfs` and the like. Matched against the line rather than by
+/// building `"{s}."` per candidate, which was a few hundred throwaway strings
+/// every second on a box with a normal number of mounts.
+fn skip_fstype(fstype: &str) -> bool {
+    SKIP_FSTYPES.iter().any(|s| fstype == *s || fstype.strip_prefix(s).is_some_and(|r| r.starts_with('.')))
+}
+
 /// Mount points backed by something real, deduplicated by source device so a
 /// bind mount or a second subvolume cannot double-count the same disk.
 ///
@@ -330,7 +338,7 @@ fn parse_mounts(text: &str) -> Vec<String> {
             continue;
         }
         let (dev, mount, fstype) = (f[0], f[1], f[2]);
-        if SKIP_FSTYPES.iter().any(|s| fstype == *s || fstype.starts_with(&format!("{s}."))) {
+        if skip_fstype(fstype) {
             continue;
         }
         if !dev.starts_with('/') && fstype != "zfs" && fstype != "btrfs" {
