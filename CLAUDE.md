@@ -4,8 +4,11 @@
 
 ## 两条铁律
 
-1. **数字必须和 `free` / `df` 对得上。** 这是这个 agent 存在的理由之一——内存和硬盘的现成写法（`sysinfo` 那对 API、htop 的公式）口径都不对，而且错得看不出来。改采集代码前读 [docs/data-accuracy.md](docs/data-accuracy.md)
-2. **agent 保持无状态。** 不写文件、不记忆跨重启的状态。它只上报"此刻内核说的数字"，累加是 hub 的事。往这里加持久化之前先问用户
+**用名字引用，别用编号**——hub 仓库也有一组铁律，编号对不上：那边的第 2 条就是这里的口径铁律，
+那边的第 1 条（总流量永不回退）在这里根本不存在，因为累加压根不在 agent 这边做。
+
+1. **口径铁律 —— 数字必须和 `free` / `df` 对得上。** 这是这个 agent 存在的理由之一：内存和硬盘的现成写法（`sysinfo` 那对 API、htop 的公式）口径都不对，而且错得看不出来。改采集代码前读 [docs/data-accuracy.md](docs/data-accuracy.md)
+2. **无状态铁律 —— 不写文件、不记忆跨重启的状态。** 它只上报"此刻内核说的数字"，累加是 hub 的事。理由（agent 跑在别人的机器上，可能被重装、迁移、kill -9，持久状态等于给每台机器发一个会坏的文件）见 hub 仓库 [decisions.md](https://github.com/stqfdyr/monitor/blob/main/docs/decisions.md) 的「agent 完全无状态」。往这里加持久化之前先问用户
 
 ## 明确不做的
 
@@ -19,7 +22,7 @@
 ## 工作方式
 
 - 用 `ponytail` skill（full），别过度设计、别过度测试。一段非平凡逻辑留一个能跑的检查就够
-- 断言要能被证伪：写完想一下**什么改动会让它变红**，想不出来就别写。铁律一的比对必须打真机，
+- 断言要能被证伪：写完想一下**什么改动会让它变红**，想不出来就别写。口径铁律的比对必须打真机，
   构造数据证明不了读的是对的字段。验证手法见 hub 仓库 [development.md](https://github.com/stqfdyr/monitor/blob/main/docs/development.md) 的「变异检查」
 - `Metrics` / `Facts` struct 就是线上协议的权威定义，别再写一份字段列表去同步
 - 改了上报字段就是改了协议，hub 那边要同步
