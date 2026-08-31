@@ -4,14 +4,14 @@ mod collect;
 
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
 
 use collect::Collector;
 
@@ -103,12 +103,6 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_env("MONITOR_LOG").add_directive("info".parse()?),
-        )
-        .init();
-
     let args = parse_args()?;
     let url = ws_url(&args.server)?;
     let mut collector = Collector::new();
@@ -117,7 +111,7 @@ async fn main() -> Result<()> {
     loop {
         let started = Instant::now();
         if let Err(e) = session(&url, &args.token, &mut collector, args.interval).await {
-            warn!("session ended: {e:#}");
+            eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, started.elapsed());
         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -154,17 +148,41 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
 /// is not a latency budget, it is the line past which nothing is coming.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The hub sends one kind of message, a probe list a few hundred bytes long.
+/// Left at its default tungstenite would accept 64 MiB of it -- the entire
+/// memory budget the unit file grants this process, handed to whoever holds the
+/// other end of the socket.
+const MAX_MESSAGE: usize = 64 * 1024;
+
+/// How long the agent waits for any frame from the hub before giving up on the
+/// connection.
+///
+/// The hub pings every 30 seconds and drops an agent that has gone quiet for
+/// 120. Nothing here mirrored that, so a path that failed in one direction only
+/// -- a NAT entry expiring, a route going dark -- left the agent writing reports
+/// into a socket the kernel goes on retransmitting for a quarter of an hour,
+/// long after the panel had already called the node offline. Against a hub that
+/// completed the handshake and then never spoke again, the agent stayed on that
+/// connection for as long as it was left running.
+///
+/// Landing under the hub's own timeout makes the agent the one that gives up
+/// first, so a one-way failure costs this constant instead of tcp_retries2.
+const HUB_SILENCE: Duration = Duration::from_secs(90);
+
 /// One connection: say hello, then report until the socket dies.
 async fn session(url: &str, token: &str, collector: &mut Collector, interval: u64) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
-    let (mut ws, _) = tokio::time::timeout(CONNECT_DEADLINE, tokio_tungstenite::connect_async(request))
+    let config =
+        WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+    let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
+    let (mut ws, _) = tokio::time::timeout(CONNECT_DEADLINE, connect)
         .await
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))?
         .context("connect")?;
-    info!("connected");
+    eprintln!("connected");
 
     ws.send(notify("hello", serde_json::to_value(collector.facts())?)).await?;
 
@@ -172,6 +190,10 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Its own timer, not the report tick, which --interval can stretch to an hour.
+    let mut watchdog = tokio::time::interval(HUB_SILENCE / 3);
+    watchdog.tick().await; // The first tick completes immediately.
+    let mut last_frame = Instant::now();
 
     let result = loop {
         tokio::select! {
@@ -179,24 +201,36 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = ws.send(notify("report", m)).await { break Err(e.into()); }
             }
+            _ = watchdog.tick() => {
+                let quiet = last_frame.elapsed();
+                if quiet > HUB_SILENCE {
+                    break Err(anyhow!("no frame from the hub in {}s", quiet.as_secs()));
+                }
+            }
             Some(msg) = result_rx.recv() => {
                 if let Err(e) = ws.send(msg).await { break Err(e.into()); }
             }
-            incoming = ws.next() => match incoming {
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
-                        if rpc.method == "ping.tasks" {
-                            if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
-                                respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+            incoming = ws.next() => {
+                // Any frame at all proves the path is still there, the hub's
+                // heartbeat ping included -- that is the only one that arrives
+                // on an otherwise idle connection.
+                last_frame = Instant::now();
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
+                            if rpc.method == "ping.tasks" {
+                                if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
+                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                                }
                             }
                         }
                     }
+                    Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => break Err(e.into()),
+                    None => break Ok(()),
                 }
-                Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => break Err(e.into()),
-                None => break Ok(()),
-            },
+            }
         }
     };
 
@@ -338,6 +372,22 @@ mod tests {
         assert!(
             HANDSHAKE_DEADLINE < Duration::from_secs(1),
             "a deadline at or past the 1s initial RTO lets retransmits be reported as latency"
+        );
+    }
+
+    /// The hub pings every 30s and drops an agent silent for 120s (its
+    /// SILENCE). Both ends of this window are load-bearing, and neither is
+    /// visible from inside this file, so they are written down here.
+    #[test]
+    fn the_agent_gives_up_on_a_silent_hub_before_the_hub_gives_up_on_it() {
+        assert!(
+            HUB_SILENCE < Duration::from_secs(120),
+            "past the hub's own timeout the agent stops being what recovers the connection"
+        );
+        assert!(HUB_SILENCE > Duration::from_secs(60), "two lost heartbeats are a blip, not a dead link");
+        assert!(
+            HUB_SILENCE / 3 <= Duration::from_secs(30),
+            "checking less often than the hub pings would round the window up by a whole heartbeat"
         );
     }
 

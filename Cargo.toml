@@ -13,8 +13,6 @@ serde_json = "1"
 # A single-threaded runtime is plenty: one report every couple of seconds plus
 # a handful of tcp probes, on someone else's VPS.
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1", features = ["fs"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # tokio-tungstenite 0.28 leaves the crypto provider to us: rustls only picks one

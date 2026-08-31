@@ -18,19 +18,25 @@
 - **跨平台**（Windows / macOS / BSD）——只支持 Linux 是刻意的，直接读 `/proc` 才能修好那几个口径问题。加跨平台等于推翻整个 `collect.rs`
 - ICMP / HTTP ping（只保留 TCP）
 - 远程命令执行、terminal
+- **日志框架**（`tracing` / `log` / `env_logger`）——全仓库两条日志，都是事后翻的运行记录，
+  `eprintln!` 就够。`tracing` + `tracing-subscriber` 曾占二进制的 20%（431 KiB）和 14 个依赖，
+  换来的是在 journald 自己的时间戳旁边再印一个，还是不同时区的
 
 ## 工作方式
 
 - 用 `ponytail` skill（full），别过度设计、别过度测试。一段非平凡逻辑留一个能跑的检查就够
 - 断言要能被证伪：写完想一下**什么改动会让它变红**，想不出来就别写。口径铁律的比对必须打真机，
   构造数据证明不了读的是对的字段。验证手法见 hub 仓库 [development.md](https://github.com/stqfdyr/monitor/blob/main/docs/development.md) 的「变异检查」
+- **期望值不要照着实现的公式写，更不要在测试里重抄一遍公式。** 那种断言改公式就红，却不知道公式
+  对不对——swap 减 SwapCached 和 CPU 报成 idle% 各在这上面躺过一次，全套测试一路绿。数字要么对
+  外部权威（`free` / `df`，进 `crosscheck`），要么至少让断言打在被测函数上
 - `Metrics` / `Facts` struct 就是线上协议的权威定义，别再写一份字段列表去同步
 - 改了上报字段就是改了协议，hub 那边要同步
 
 ## 常用命令
 
 ```bash
-cargo test                # 14 个
+cargo test                # 15 个
 cargo clippy --all-targets
 cargo test crosscheck -- --nocapture   # 采集值与 free / df 自动比对，顺带打印
 ```
