@@ -152,18 +152,11 @@ impl Collector {
     /// CPU busy share since the previous call. First call has no baseline and
     /// reports 0 rather than a meaningless since-boot average.
     fn cpu_percent(&mut self) -> f32 {
-        let Some((total, idle)) = cpu_jiffies() else {
+        let Some(now) = cpu_jiffies() else {
             return 0.0;
         };
-        let pct = match self.prev_cpu {
-            Some((pt, pi)) if total > pt => {
-                let dt = (total - pt) as f32;
-                let di = idle.saturating_sub(pi) as f32;
-                ((dt - di) / dt * 100.0).clamp(0.0, 100.0)
-            }
-            _ => 0.0,
-        };
-        self.prev_cpu = Some((total, idle));
+        let pct = self.prev_cpu.map_or(0.0, |prev| busy_percent(prev, now));
+        self.prev_cpu = Some(now);
         pct
     }
 
@@ -217,18 +210,45 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
     if total == 0 {
         return (0, 0);
     }
-    let available = match g("MemAvailable") {
-        0 => g("MemFree") + g("Buffers") + g("Cached"), // pre-3.14 kernels
-        v => v,
-    };
+    // Absence is what selects the fallback, not a zero value: a box under real
+    // pressure reports MemAvailable 0, and treating that as "field missing"
+    // would answer with MemFree + Buffers + Cached and understate the used
+    // figure at the one moment it has to be right.
+    let available =
+        m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
     (total, total.saturating_sub(available))
 }
 
+/// `free(1)`'s Swap used column, which is `SwapTotal - SwapFree` and nothing
+/// else.
+///
+/// Subtracting `SwapCached` as well reads as if the pages that were swapped
+/// back in had released their slots, and they have not: the copy on the device
+/// is still there, still occupying blocks, until something else needs them.
+/// That subtraction reported 26 MiB where `free` said 33 MiB on the box this
+/// was found on -- a fifth of the figure, always low, always plausible.
 fn swap_used(m: &HashMap<String, u64>) -> (u64, u64) {
     let g = |k: &str| m.get(k).copied().unwrap_or(0);
     let total = g("SwapTotal");
-    let used = total.saturating_sub(g("SwapFree") + g("SwapCached"));
-    (total, used.min(total))
+    (total, total.saturating_sub(g("SwapFree")))
+}
+
+/// Busy share between two `(total, idle)` jiffy readings.
+///
+/// Split out of [`Collector::cpu_percent`], which reads /proc/stat and does the
+/// arithmetic in one body and so could only be tested against a live machine.
+/// The test that covered this used to carry its own copy of the formula and
+/// assert on that, which meant the arithmetic here answered to nothing: turning
+/// it from busy into idle -- the panel reading backwards -- left every test
+/// green.
+fn busy_percent(prev: (u64, u64), now: (u64, u64)) -> f32 {
+    let ((pt, pi), (total, idle)) = (prev, now);
+    if total <= pt {
+        return 0.0;
+    }
+    let dt = (total - pt) as f32;
+    let di = idle.saturating_sub(pi) as f32;
+    ((dt - di) / dt * 100.0).clamp(0.0, 100.0)
 }
 
 fn cpu_jiffies() -> Option<(u64, u64)> {
@@ -482,9 +502,11 @@ mod tests {
         // The bug this replaces: counting cache as used reported ~3.3 GiB here.
         assert!(used < (total - g_cached(&m)), "page cache must not count as used");
 
+        // free's Swap used column is total - free. SwapCached is deliberately
+        // not subtracted: those pages still hold their blocks on the device.
         let (st, su) = swap_used(&m);
         assert_eq!(st, 1048572 * 1024);
-        assert_eq!(su, (1048572 - 987264 - 13280) * 1024);
+        assert_eq!(su, (1048572 - 987264) * 1024, "must match the `free` swap used column");
     }
 
     fn g_cached(m: &HashMap<String, u64>) -> u64 {
@@ -507,13 +529,12 @@ mod tests {
         assert!(parse_cpu_jiffies("garbage").is_none());
 
         // 100 more jiffies since the baseline, 25 of them idle => 75% busy.
-        let mut c = Collector::new();
-        c.prev_cpu = Some((1000, 925));
-        let busy = |(total, idle): (u64, u64), prev: (u64, u64)| {
-            let dt = (total - prev.0) as f32;
-            ((dt - (idle - prev.1) as f32) / dt * 100.0).clamp(0.0, 100.0)
-        };
-        assert_eq!(busy((1100, 950), c.prev_cpu.unwrap()), 75.0);
+        // Asserted against the function the binary runs, not a copy of it in
+        // the test: the copy let busy and idle be swapped without a red.
+        assert_eq!(busy_percent((1000, 925), (1100, 950)), 75.0);
+        assert_eq!(busy_percent((1000, 925), (1100, 1025)), 0.0, "a fully idle interval is 0% busy");
+        // A counter that went backwards is a reboot, not 100% busy.
+        assert_eq!(busy_percent((1000, 925), (500, 400)), 0.0);
         // A live box has no baseline on the first call, so it reports 0.
         assert_eq!(Collector::new().cpu_percent(), 0.0);
     }
@@ -599,10 +620,14 @@ mod tests {
 mod crosscheck {
     use super::*;
 
-    /// The first of the two rules, checked against the tools it names rather
-    /// than printed for a human to check. Constructed /proc text can only show
-    /// the arithmetic is right; it cannot show the right field was read, and
+    /// The accuracy rule, checked against the tools it names rather than
+    /// printed for a human to check. Constructed /proc text can only show the
+    /// arithmetic is right; it cannot show the right field was read, and
     /// reading the wrong field is the bug this agent exists to fix.
+    ///
+    /// Every figure `free` and `df` also report is compared here, swap
+    /// included. A metric left out is a metric whose reading nothing checks,
+    /// and swap spent its whole life outside this test being a fifth low.
     ///
     /// The tolerance covers the machine moving between the two readings, and it
     /// is an order of magnitude below every wrong answer: on this box the root
@@ -617,6 +642,7 @@ mod crosscheck {
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
         println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));
         println!("disk used={:.2}G total={:.2}G", gib(m.disk_used), gib(m.disk_total));
+        println!("swap used={:.2}G total={:.2}G", gib(m.swap_used), gib(m.swap_total));
         println!("net  rx_total={} tx_total={}", m.net_rx_total, m.net_tx_total);
 
         const TOLERANCE: u64 = 64 * 1024 * 1024;
@@ -632,6 +658,18 @@ mod crosscheck {
         let parse = |v: Option<&str>| v.expect("free column").parse::<u64>().expect("a byte count");
         assert_eq!(m.mem_total, parse(row.next()), "MemTotal is not free's total");
         close(m.mem_used, parse(row.next()), "memory");
+
+        // free(1) row "Swap:": total, used, free. Held to a far tighter
+        // tolerance than memory, because the miscount it exists to catch --
+        // subtracting SwapCached -- was 6 MiB on the box that found it, and the
+        // memory tolerance would have waved it straight through. Swap moves
+        // slowly enough between two readings that a megabyte is room to spare.
+        const SWAP_TOLERANCE: u64 = 1024 * 1024;
+        let mut row = free.lines().nth(2).expect("free prints a Swap: row").split_whitespace().skip(1);
+        assert_eq!(m.swap_total, parse(row.next()), "SwapTotal is not free's swap total");
+        let theirs = parse(row.next());
+        let drift = m.swap_used.abs_diff(theirs);
+        assert!(drift < SWAP_TOLERANCE, "swap: ours={} theirs={theirs} drift={drift}", m.swap_used);
 
         // df(1) counts the root reserve as free, which is f_bfree and not
         // f_bavail. Compared against one filesystem, because df is being asked

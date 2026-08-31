@@ -23,7 +23,9 @@ used = MemTotal - MemAvailable
 
 这也正好是现代 `free(1)` 的 used 列的算法（procps 的 `free.c`：`mem_used = kb_main_total - kb_main_available`）。
 
-`MemAvailable` 不存在时（3.14 以前的内核、某些容器）退回 `MemFree + Buffers + Cached`。
+`MemAvailable` 不存在时（3.14 以前的内核、某些容器）退回 `MemFree + Buffers + Cached`。判据是
+**字段在不在**，不是值等不等于 0：一台真正吃紧的机器 `MemAvailable` 就是 0，按值判断会误走回退分支，
+在最需要报准的那一刻把已用内存报低。
 
 ### 为什么不用 htop 的公式
 
@@ -58,7 +60,8 @@ htop     total - (free+cached+sreclaimable+buffers) + shmem = 100.4 MiB
 - 用户对照的是 `free -h`，不是 htop
 - 一行减法 vs 五个字段的公式，前者更难写错
 
-内存是唯一有这种分歧的指标。硬盘、进程数、UDP、uptime 都只有一个读法，读的就是内核给的那个数。
+内存和 swap 是仅有的两个「有分歧的读法」的指标，而且两次都是同一个教训：一个听起来讲得通的
+调整，换来一个系统性偏低的数字。硬盘、进程数、UDP、uptime 都只有一个读法，读的就是内核给的那个数。
 TCP 连接数看着会跳，那是 TIME_WAIT 每秒都在变，不是口径问题——同一时刻 sockstat
 （`inuse 8 + tw 8 + TCP6 inuse 3 = 19`）和 `/proc/net/tcp` 的行数（19）是对得上的。
 
@@ -67,10 +70,25 @@ TCP 连接数看着会跳，那是 TIME_WAIT 每秒都在变，不是口径问�
 ### swap
 
 ```rust
-used = SwapTotal - SwapFree - SwapCached
+used = SwapTotal - SwapFree
 ```
 
-`SwapCached` 是已经换回内存但 swap 里还留着副本的页，不算真正占用。
+和 `free` 的 Swap used 列一样，**不减 `SwapCached`**。
+
+原本减了。理由写的是「`SwapCached` 是已经换回内存但 swap 里还留着副本的页，不算真正占用」——听着
+成立，但它答的不是这一栏要问的问题。那些页换回内存之后，**swap 设备上的块并没有释放**，内核留着
+副本正是为了下次换出时不用再写一遍；要到别的页需要那些块时才会真正回收。所以它们确实占着 swap。
+
+实机对照（ccs，`free -b`）：
+
+| | swap used |
+|---|---|
+| `free` | 32,968,704 |
+| 减 SwapCached | 26,222,592 |
+| 差 | 6,746,112（正好一个 `SwapCached`，低 20%） |
+
+**这个错法能活下来，是因为 `crosscheck` 当时只比对内存和硬盘。** 现在它也比对 swap 了，容差单独设成
+1 MiB：swap 变化远比内存慢，而这里要抓的偏差本身只有几 MB——64 MiB 的内存容差会把它整个放过去。
 
 ## 硬盘
 
@@ -123,6 +141,10 @@ busy% = (总增量 - idle 增量) / 总增量 * 100
 user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的宿主机的 CPU 占用算低。
 
 **第一次采集返回 0**，因为没有基线。返回自开机以来的平均值会是个毫无意义的数字。
+
+算差值的那段拆成了 `busy_percent(prev, now)` 纯函数，`cpu_percent()` 只负责读 `/proc/stat` 和存基线。
+拆之前两件事挤在一个函数里，喂不进构造数据，测试只好在自己身上重抄一份公式来断言——结果把 busy
+换成 idle（面板上 CPU 整个反过来）全套测试照样绿。测试：`cpu_percent_needs_a_baseline_then_uses_deltas`。
 
 ## 连接数
 
@@ -196,9 +218,13 @@ user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的
 cargo test crosscheck -- --nocapture     # 仍然打印，同时会断言
 ```
 
-容差 64 MiB，留给两次取值之间机器自己的变化。它比任何一种错口径都小一个数量级——本机上
+内存和硬盘容差 64 MiB，留给两次取值之间机器自己的变化，而它比任何一种错口径都小一个数量级——本机上
 `df` 排除的 root 预留是 3.2 GiB，sysinfo 会记成已用的 page cache 是 2.4 GiB，htop 公式的偏差
 288 MiB，全都远在容差之外。差到几百 MB 就是口径错了，不是抖动。
+
+swap 单独用 1 MiB，理由见上面 swap 一节：它要抓的偏差只有几 MB，用 64 MiB 会整个放过去。
+**每加一个上报字段，就问一句它能不能进这里**——swap 从写下的第一天就是错的，而它能一直错下去，
+唯一的原因是这个比对没带上它。
 
 **这个比对必须打真机**：构造一段 `/proc/meminfo` 文本只能证明算术没写错，证明不了读的是对的
 字段——而读错字段正是这个 agent 要修的原始 bug。用 `f_bavail` 代替 `f_bfree` 在构造数据上
@@ -212,6 +238,11 @@ cargo test crosscheck -- --nocapture     # 仍然打印，同时会断言
 |---|---|---|
 | 内存 | 1.01 GiB / 3.82 GiB | `free` 1.02 / 3.82 |
 | 硬盘 | 11.83 GiB / 58.94 GiB | `df` 11.83 / 58.94 |
+| swap | 31.4 MiB / 1.00 GiB | `free` 31.4 / 1.00 |
+
+同一次对照里另外几个字段（都不在 crosscheck 里，因为没有一条 `free` / `df` 那样的权威口径可比）：
+`procs` 114 对 `ps -e` 110、`tcp` 64 对 `ss -t -a` 65、`udp` 4 对 4、`uptime` 1964951 对 1964971、
+`load` 0.25/0.57/0.55 对 0.40/0.58/0.55——差的都是两次取值之间的时间，不是口径。
 
 ## 不要引入 sysinfo
 
