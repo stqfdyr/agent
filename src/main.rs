@@ -52,10 +52,9 @@ fn parse_args() -> Result<Args> {
     Ok(Args { server, token, interval: interval.clamp(1, 3600) })
 }
 
-/// `https://host/path` -> `wss://host/path/api/agent/ws`.
-///
-/// The token travels in an Authorization header rather than the query string,
-/// so it stays out of reverse-proxy access logs.
+/// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
+/// an Authorization header rather than the query string, so it stays out of
+/// reverse-proxy access logs.
 fn ws_url(server: &str) -> Result<String> {
     let base = server.trim_end_matches('/');
     let base = match base.split_once("://") {
@@ -70,8 +69,8 @@ fn ws_url(server: &str) -> Result<String> {
     Ok(format!("{base}/api/agent/ws"))
 }
 
-/// IPv6 literals are bracketed, so the port cannot simply be split off at the
-/// first colon.
+/// IPv6 literals are bracketed, so the port cannot be split off at the first
+/// colon.
 fn is_loopback(url: &str) -> bool {
     let authority = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
     let host = match authority.strip_prefix('[') {
@@ -118,14 +117,13 @@ async fn main() -> Result<()> {
     }
 }
 
-/// How long to wait before reconnecting, from the previous wait and how long the
-/// session that just ended had lasted.
+/// How long to wait before reconnecting, from the previous wait and how long
+/// the session that just ended had lasted.
 ///
-/// A session that reported for a while proves the hub is reachable and the token
-/// good, so whatever ended it was the hub restarting or the network blinking --
-/// that costs one second, not the minute a dead endpoint has earned. Only
-/// sessions that die young keep doubling, which is what keeps an agent off a hub
-/// stuck in a crash loop.
+/// A session that reported for a while proves the hub reachable and the token
+/// good, so whatever ended it was a restart or a network blink -- one second,
+/// not the minute a dead endpoint has earned. Only sessions that die young keep
+/// doubling, which is what keeps an agent off a hub in a crash loop.
 fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
     if lasted >= Duration::from_secs(30) {
         1
@@ -137,36 +135,30 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
 /// Deadline for getting a connection up, covering all three stages of it.
 ///
 /// Only the TCP handshake has a deadline of its own; the TLS exchange and the
-/// HTTP upgrade have none. A peer that accepts the connection and then says
-/// nothing — a half-open socket left behind a tunnel, a stalled edge — leaves
-/// `connect_async` awaiting forever, and with it an agent that is still running
-/// and has stopped reporting, with nothing in its log to say so. The reconnect
-/// loop below can only recover from a connect that comes back.
+/// HTTP upgrade have none. A peer that accepts and then says nothing leaves
+/// `connect_async` awaiting forever, and with it an agent still running, no
+/// longer reporting, with nothing in its log to say so.
 ///
-/// Generous on purpose: a healthy connect here takes a quarter of a second, and
-/// the slowest real one measured was a tunnel re-establishing for sixty. This
-/// is not a latency budget, it is the line past which nothing is coming.
+/// Generous on purpose: a healthy connect takes a quarter of a second and the
+/// slowest measured was sixty. This is not a latency budget, it is the line
+/// past which nothing is coming.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The hub sends one kind of message, a probe list a few hundred bytes long.
-/// Left at its default tungstenite would accept 64 MiB of it -- the entire
-/// memory budget the unit file grants this process, handed to whoever holds the
-/// other end of the socket.
+/// Left at its default tungstenite accepts 64 MiB of it -- the whole memory
+/// budget the unit file grants this process, handed to the other end.
 const MAX_MESSAGE: usize = 64 * 1024;
 
-/// How long the agent waits for any frame from the hub before giving up on the
-/// connection.
+/// How long the agent waits for any frame from the hub before giving up.
 ///
-/// The hub pings every 30 seconds and drops an agent that has gone quiet for
-/// 120. Nothing here mirrored that, so a path that failed in one direction only
-/// -- a NAT entry expiring, a route going dark -- left the agent writing reports
-/// into a socket the kernel goes on retransmitting for a quarter of an hour,
-/// long after the panel had already called the node offline. Against a hub that
-/// completed the handshake and then never spoke again, the agent stayed on that
-/// connection for as long as it was left running.
+/// The hub pings every 30 seconds and drops an agent quiet for 120. Without a
+/// mirror of that, a path failing in one direction only -- a NAT entry
+/// expiring, a route going dark -- leaves the agent writing into a socket the
+/// kernel retransmits on for a quarter of an hour, long after the panel has
+/// called the node offline.
 ///
-/// Landing under the hub's own timeout makes the agent the one that gives up
-/// first, so a one-way failure costs this constant instead of tcp_retries2.
+/// Landing under the hub's own timeout makes the agent give up first, so a
+/// one-way failure costs this constant instead of tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
 /// One connection: say hello, then report until the socket dies.
@@ -211,9 +203,9 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
                 if let Err(e) = ws.send(msg).await { break Err(e.into()); }
             }
             incoming = ws.next() => {
-                // Any frame at all proves the path is still there, the hub's
-                // heartbeat ping included -- that is the only one that arrives
-                // on an otherwise idle connection.
+                // Any frame proves the path is still there, the hub's
+                // heartbeat ping included -- the only one that arrives on an
+                // otherwise idle connection.
                 last_frame = Instant::now();
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
@@ -241,7 +233,7 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
 }
 
 /// Replaces the running probe loops with the hub's current task list, leaving
-/// unchanged tasks alone so their timers do not restart on every push.
+/// unchanged tasks alone so their timers survive a push.
 fn respawn_ping_tasks(
     running: &mut Vec<(PingTask, tokio::task::JoinHandle<()>)>,
     wanted: Vec<PingTask>,
@@ -279,25 +271,22 @@ fn respawn_ping_tasks(
 /// Deadline for one handshake, deliberately under the kernel's first SYN
 /// retransmit.
 ///
-/// Linux arms its initial SYN timer at one second. Wait longer than that and a
-/// dropped SYN does not fail — it succeeds late, and `connect` hands back the
-/// retransmit timer plus the round trip instead of the round trip. Those are
-/// not slow pings, they are a different measurement wearing the same units.
+/// Linux arms its initial SYN timer at one second. Wait longer and a dropped
+/// SYN does not fail, it succeeds late: `connect` hands back the retransmit
+/// timer plus the round trip, which is a different measurement in the same
+/// units.
 ///
-/// Cutting the wait short means a reading that comes back always belongs to a
-/// handshake that completed on the first SYN, so it is a real round trip; a
-/// dropped one becomes -1, which is what it actually was. The cost is that a
-/// link whose genuine round trip exceeds this is reported unreachable — at
-/// which point it is, for anything anyone would use it for.
+/// Cutting the wait short means every reading that comes back belongs to a
+/// handshake that completed on the first SYN, and a dropped one becomes -1. The
+/// cost is that a link whose genuine round trip exceeds this reads unreachable.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(900);
 
 /// Round trip of a TCP handshake to the target, in milliseconds; -1 when the
 /// SYN went unanswered inside [`HANDSHAKE_DEADLINE`].
 ///
-/// The name is resolved before the clock starts. `TcpStream::connect` on a
-/// hostname resolves first and connects second, which folded the resolver's
-/// latency into every sample — on a domain target that was most of the number,
-/// and it is what made these readings sit far above what the link deserved.
+/// The name is resolved before the clock starts: `TcpStream::connect` on a
+/// hostname resolves first and connects second, folding the resolver's latency
+/// into every sample.
 async fn tcp_ping(target: &str) -> i32 {
     let Ok(mut addresses) = tokio::net::lookup_host(target).await else { return -1 };
     let Some(address) = addresses.next() else { return -1 };
@@ -314,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
-        // Nothing on the other end: double until the ceiling and stay there.
+        // Nothing on the other end: double to the ceiling and stay there.
         let mut wait = 0;
         let climb: Vec<u64> = (0..8)
             .map(|_| {
@@ -324,9 +313,8 @@ mod tests {
             .collect();
         assert_eq!(climb, [1, 2, 4, 8, 16, 32, 60, 60]);
 
-        // A session that actually ran starts over, however high the wait had
-        // climbed -- this is the hub-restart case, and 60s of blank panel was
-        // the bug.
+        // A session that ran starts over however high the wait had climbed:
+        // the hub-restart case, where 60s of blank panel was the bug.
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped before it proved anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
@@ -336,10 +324,10 @@ mod tests {
     fn ws_url_upgrades_scheme_and_refuses_plaintext_to_remote() {
         assert_eq!(ws_url("https://hub.example.com/").unwrap(), "wss://hub.example.com/api/agent/ws");
         assert_eq!(ws_url("http://127.0.0.1:8080").unwrap(), "ws://127.0.0.1:8080/api/agent/ws");
-        // Bare host defaults to TLS rather than silently leaking the token.
+        // A bare host defaults to TLS rather than leaking the token.
         assert!(ws_url("hub.example.com").unwrap().starts_with("wss://"));
         assert!(ws_url("http://hub.example.com").is_err());
-        // Bracketed IPv6 loopback must be recognised, not treated as remote.
+        // Bracketed IPv6 loopback is not remote.
         assert_eq!(ws_url("http://[::1]:8080").unwrap(), "ws://[::1]:8080/api/agent/ws");
         // No token anywhere in the URL: it rides in a header instead.
         assert!(!ws_url("https://hub.example.com").unwrap().contains("token"));
@@ -350,23 +338,22 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
-        // A loopback handshake finishes inside a millisecond, so the reading
-        // here is 0 whether it is timed or not. What this pins is the contract
-        // either side of it -- reachable is non-negative, unreachable is -1.
-        // That the number is a real round trip rests on the deadline below and
-        // on the controlled experiment in docs/data-accuracy.md.
+        // A loopback handshake finishes inside a millisecond, so this reading
+        // is 0 whether it is timed or not. What it pins is the contract either
+        // side: reachable is non-negative, unreachable is -1. That the number
+        // is a real round trip rests on the deadline test below.
         assert!(tcp_ping(&addr.to_string()).await >= 0);
         assert_eq!(tcp_ping("127.0.0.1:1").await, -1, "nothing is listening there");
-        // A target the hub sent that will not even resolve must come back as
-        // unreachable rather than take the probe down.
+        // A target that will not resolve comes back unreachable rather than
+        // taking the probe down.
         assert_eq!(tcp_ping("127.0.0.1:99999").await, -1, "not a parseable target");
     }
 
     /// The deadline is the whole mechanism: it has to land under the kernel's
     /// first SYN retransmit, or a dropped SYN comes back as a ~1200ms "latency"
-    /// that is really the 1s timer plus the round trip. A production database
-    /// had 161 such readings, every one of them in a 1200ms or 3200ms cluster
-    /// with nothing in between — the signature of a retransmit, not a slow link.
+    /// that is really the 1s timer plus the round trip. Those readings cluster
+    /// at 1200ms and 3200ms with nothing in between -- the signature of a
+    /// retransmit, not a slow link.
     #[test]
     fn the_handshake_deadline_stays_under_the_kernels_syn_timer() {
         assert!(
@@ -376,8 +363,8 @@ mod tests {
     }
 
     /// The hub pings every 30s and drops an agent silent for 120s (its
-    /// SILENCE). Both ends of this window are load-bearing, and neither is
-    /// visible from inside this file, so they are written down here.
+    /// SILENCE). Both ends of this window are load-bearing and neither is
+    /// visible from this file.
     #[test]
     fn the_agent_gives_up_on_a_silent_hub_before_the_hub_gives_up_on_it() {
         assert!(
@@ -393,7 +380,7 @@ mod tests {
 
     #[test]
     fn ping_tasks_keep_their_timers_unless_the_task_changed() {
-        // Same flavour the binary runs on, so the test exercises the real thing.
+        // The flavour the binary runs on, so this exercises the real thing.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
@@ -412,13 +399,13 @@ mod tests {
         );
         assert_eq!(running.len(), 3);
         assert_eq!(running[0].1.id(), first, "unchanged task must not be restarted");
-        // The other half of the same rule: a task whose target moved has to be
-        // torn down, or it goes on probing the old address forever.
+        // The other half of the rule: a task whose target moved is torn down,
+        // or it goes on probing the old address.
         assert_ne!(running[1].1.id(), second, "a retargeted task must be restarted");
 
-        // A hub that sends interval 0 must not take the probe down with it.
-        // tokio's interval panics on a zero period, and a panicked task is a
-        // probe that stops reporting without ever saying so.
+        // A hub that sends interval 0 must not take the probe down: tokio's
+        // interval panics on a zero period, and a panicked task stops
+        // reporting without saying so.
         respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
         assert!(!running[0].1.is_finished(), "a zero interval must be clamped, not panic the probe");

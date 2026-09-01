@@ -76,7 +76,7 @@ pub struct Metrics {
     pub disk_total: u64,
     pub disk_used: u64,
     /// Kernel lifetime byte counters. The hub accumulates these; the agent
-    /// stores nothing and never tries to survive a reboot itself.
+    /// stores nothing and does not try to survive a reboot.
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     pub net_rx: u64,
@@ -149,8 +149,8 @@ impl Collector {
         }
     }
 
-    /// CPU busy share since the previous call. First call has no baseline and
-    /// reports 0 rather than a meaningless since-boot average.
+    /// CPU busy share since the previous call. The first has no baseline and
+    /// reports 0 rather than a since-boot average.
     fn cpu_percent(&mut self) -> f32 {
         let Some(now) = cpu_jiffies() else {
             return 0.0;
@@ -167,7 +167,7 @@ impl Collector {
                 if secs <= 0.0 {
                     (0, 0)
                 } else {
-                    // A backwards counter means a reboot or a wrap; report no
+                    // A backwards counter means a reboot or a wrap: report no
                     // spike rather than a garbage number.
                     (
                         (rx.saturating_sub(prx) as f64 / secs) as u64,
@@ -203,17 +203,16 @@ fn parse_meminfo(text: &str) -> HashMap<String, u64> {
 
 /// `free(1)`'s used column: total minus the kernel's own MemAvailable
 /// estimate. sysinfo's `used_memory()` counts page cache as used and reads
-/// gigabytes too high on any box that has been up for a while.
+/// gigabytes high on a box that has been up for a while.
 fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
     let g = |k: &str| m.get(k).copied().unwrap_or(0);
     let total = g("MemTotal");
     if total == 0 {
         return (0, 0);
     }
-    // Absence is what selects the fallback, not a zero value: a box under real
-    // pressure reports MemAvailable 0, and treating that as "field missing"
-    // would answer with MemFree + Buffers + Cached and understate the used
-    // figure at the one moment it has to be right.
+    // Absence selects the fallback, not a zero value: a box under real
+    // pressure reports MemAvailable 0, and treating that as a missing field
+    // understates the used figure at the moment it has to be right.
     let available =
         m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
     (total, total.saturating_sub(available))
@@ -222,11 +221,10 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
 /// `free(1)`'s Swap used column, which is `SwapTotal - SwapFree` and nothing
 /// else.
 ///
-/// Subtracting `SwapCached` as well reads as if the pages that were swapped
-/// back in had released their slots, and they have not: the copy on the device
-/// is still there, still occupying blocks, until something else needs them.
-/// That subtraction reported 26 MiB where `free` said 33 MiB on the box this
-/// was found on -- a fifth of the figure, always low, always plausible.
+/// Subtracting `SwapCached` reads as if pages swapped back in had released
+/// their slots. They have not: the copy on the device still occupies blocks
+/// until something else needs them. That subtraction runs about a fifth low --
+/// always low, always plausible.
 fn swap_used(m: &HashMap<String, u64>) -> (u64, u64) {
     let g = |k: &str| m.get(k).copied().unwrap_or(0);
     let total = g("SwapTotal");
@@ -236,10 +234,9 @@ fn swap_used(m: &HashMap<String, u64>) -> (u64, u64) {
 /// Busy share between two `(total, idle)` jiffy readings.
 ///
 /// Split out of [`Collector::cpu_percent`], which reads /proc/stat and does the
-/// arithmetic in one body and so could only be tested against a live machine.
-/// The test that covered this used to carry its own copy of the formula and
-/// assert on that, which meant the arithmetic here answered to nothing: turning
-/// it from busy into idle -- the panel reading backwards -- left every test
+/// arithmetic in one body and could only be tested against a live machine. The
+/// test that covered it carried its own copy of the formula, so this
+/// arithmetic answered to nothing: swapping busy for idle left every test
 /// green.
 fn busy_percent(prev: (u64, u64), now: (u64, u64)) -> f32 {
     let ((pt, pi), (total, idle)) = (prev, now);
@@ -261,9 +258,9 @@ fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
     if v.len() < 5 {
         return None;
     }
-    // idle + iowait are both time the CPU was not doing work. guest and
-    // guest_nice are already counted inside user and nice, so the sum stops
-    // before them rather than charging that time twice.
+    // idle + iowait are both time the CPU did no work. guest and guest_nice
+    // are already inside user and nice, so the sum stops before them rather
+    // than charging that time twice.
     Some((v.iter().take(8).sum(), v[3] + v[4]))
 }
 
@@ -281,14 +278,12 @@ fn uptime() -> u64 {
         .unwrap_or(0.0) as u64
 }
 
-/// The first real address of each family the kernel reports. On a VPS these
-/// are the public ones; behind NAT the v4 is private, which is the honest
-/// answer for what this machine actually holds — nothing is asked of any
-/// outside service.
+/// The first real address of each family the kernel reports. On a VPS these are
+/// the public ones; behind NAT the v4 is private, which is what this machine
+/// actually holds -- nothing is asked of any outside service.
 ///
-/// Interfaces are filtered by the same prefix list that keeps virtual devices
-/// out of the traffic counters, so a docker bridge cannot be mistaken for the
-/// machine's address.
+/// Filtered by the same prefix list that keeps virtual devices out of the
+/// traffic counters, so a docker bridge cannot pass for the machine's address.
 fn addresses() -> (String, String) {
     let (mut v4, mut v6) = (String::new(), String::new());
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
@@ -331,10 +326,9 @@ fn skip_iface(name: &str) -> bool {
     SKIP_IFACES.iter().any(|p| name.starts_with(p))
 }
 
-/// A pseudo filesystem, either named outright or as a flavour of one the list
-/// holds — `fuse.lxcfs` and the like. Matched against the line rather than by
-/// building `"{s}."` per candidate, which was a few hundred throwaway strings
-/// every second on a box with a normal number of mounts.
+/// A pseudo filesystem, named outright or as a flavour of one -- `fuse.lxcfs`
+/// and the like. Matched against the line rather than by building `"{s}."` per
+/// candidate, which was a few hundred throwaway strings a second.
 fn skip_fstype(fstype: &str) -> bool {
     SKIP_FSTYPES.iter().any(|s| fstype == *s || fstype.strip_prefix(s).is_some_and(|r| r.starts_with('.')))
 }
@@ -342,9 +336,9 @@ fn skip_fstype(fstype: &str) -> bool {
 /// Mount points backed by something real, deduplicated by source device so a
 /// bind mount or a second subvolume cannot double-count the same disk.
 ///
-/// Re-read on every sample rather than cached at startup: a disk attached
-/// later would otherwise stay invisible until the agent was restarted, and
-/// /proc/self/mounts is a few kilobytes.
+/// Re-read every sample rather than cached at startup, or a disk attached later
+/// stays invisible until the agent restarts. /proc/self/mounts is a few
+/// kilobytes.
 fn real_mount_points() -> Vec<String> {
     parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
 }
@@ -375,9 +369,9 @@ fn parse_mounts(text: &str) -> Vec<String> {
     out
 }
 
-/// `used = total - free`, exactly what df reports. The obvious alternative,
-/// `total - available`, charges ext4's 5% root reserve to the user and shows a
-/// freshly formatted disk as several percent full.
+/// `used = total - free`, exactly what df reports. `total - available` charges
+/// ext4's 5% root reserve to the user and shows a fresh disk several percent
+/// full.
 fn disk_usage(mounts: &[String]) -> (u64, u64) {
     let mut total = 0u64;
     let mut used = 0u64;
@@ -390,11 +384,11 @@ fn disk_usage(mounts: &[String]) -> (u64, u64) {
     (total, used)
 }
 
-/// Socket counts from /proc/net/sockstat, which is a handful of short lines.
-/// Counting lines in /proc/net/tcp meant reading and parsing the entire
-/// connection table once a second — hundreds of kilobytes on a busy box, for
-/// a number the kernel already keeps. TIME_WAIT sockets live in the v4 `tw`
-/// counter for both families, so they are added once.
+/// Socket counts from /proc/net/sockstat, a handful of short lines. Counting
+/// lines in /proc/net/tcp reads the whole connection table once a second --
+/// hundreds of kilobytes on a busy box, for a number the kernel already keeps.
+/// TIME_WAIT sockets live in the v4 `tw` counter for both families, so they are
+/// added once.
 fn conn_counts() -> (u32, u32) {
     parse_sockstat(
         &fs::read_to_string("/proc/net/sockstat").unwrap_or_default(),
@@ -489,7 +483,7 @@ mod tests {
 
     #[test]
     fn memory_matches_free_not_sysinfo() {
-        // Real /proc/meminfo from a 3.8 GiB box holding 2.5 GiB of page cache.
+        // Real /proc/meminfo from a 3.8 GiB box holding 2.5 GiB of cache.
         let m = parse_meminfo(
             "MemTotal:        4008884 kB\nMemFree:          602756 kB\nMemAvailable:    2947484 kB\n\
              Buffers:          129100 kB\nCached:          2351560 kB\nSReclaimable:     154008 kB\n\
@@ -499,11 +493,11 @@ mod tests {
         let (total, used) = mem_used(&m);
         assert_eq!(total, 4008884 * 1024);
         assert_eq!(used, (4008884 - 2947484) * 1024, "must match the `free` used column");
-        // The bug this replaces: counting cache as used reported ~3.3 GiB here.
+        // Counting cache as used reports ~3.3 GiB here.
         assert!(used < (total - g_cached(&m)), "page cache must not count as used");
 
-        // free's Swap used column is total - free. SwapCached is deliberately
-        // not subtracted: those pages still hold their blocks on the device.
+        // free's Swap used column is total - free. SwapCached is not
+        // subtracted: those pages still hold their blocks on the device.
         let (st, su) = swap_used(&m);
         assert_eq!(st, 1048572 * 1024);
         assert_eq!(su, (1048572 - 987264) * 1024, "must match the `free` swap used column");
@@ -523,14 +517,14 @@ mod tests {
     #[test]
     fn cpu_percent_needs_a_baseline_then_uses_deltas() {
         assert_eq!(parse_cpu_jiffies("cpu  40 0 35 925 0 0 0 0 0 0\n"), Some((1000, 925)));
-        // The last two columns are guest and guest_nice, which the kernel has
-        // already counted inside user and nice: 80 busy jiffies, not 1080.
+        // The last two columns are guest and guest_nice, already counted
+        // inside user and nice: 80 busy jiffies, not 1080.
         assert_eq!(parse_cpu_jiffies("cpu  10 10 10 10 10 10 10 10 500 500\n"), Some((80, 20)));
         assert!(parse_cpu_jiffies("garbage").is_none());
 
-        // 100 more jiffies since the baseline, 25 of them idle => 75% busy.
-        // Asserted against the function the binary runs, not a copy of it in
-        // the test: the copy let busy and idle be swapped without a red.
+        // 100 more jiffies since the baseline, 25 idle => 75% busy. Asserted
+        // against the function the binary runs, not a copy of it: the copy let
+        // busy and idle be swapped without a red.
         assert_eq!(busy_percent((1000, 925), (1100, 950)), 75.0);
         assert_eq!(busy_percent((1000, 925), (1100, 1025)), 0.0, "a fully idle interval is 0% busy");
         // A counter that went backwards is a reboot, not 100% busy.
@@ -543,8 +537,8 @@ mod tests {
     fn socket_counts_come_from_sockstat_not_the_connection_table() {
         let v4 = "sockets: used 226\nTCP: inuse 78 orphan 1 tw 7 alloc 85 mem 119\nUDP: inuse 2 mem 150\n";
         let v6 = "TCP6: inuse 1\nUDP6: inuse 4\n";
-        // Matches what counting lines in /proc/net/tcp{,6} reported on this box:
-        // TIME_WAIT sockets are held in the v4 `tw` field for both families.
+        // Matches counting lines in /proc/net/tcp{,6}: TIME_WAIT sockets are
+        // held in the v4 `tw` field for both families.
         assert_eq!(parse_sockstat(v4, v6), (86, 6));
         assert_eq!(parse_sockstat("", ""), (0, 0));
     }
@@ -572,9 +566,8 @@ mod tests {
     }
 
     /// Two independent guards drop a mount: its filesystem type, and whether
-    /// its source looks like a device. Most junk trips both, which means either
-    /// one can be deleted without a row moving -- so the fixture carries a line
-    /// that only one of them catches.
+    /// its source looks like a device. Most junk trips both, so either could be
+    /// deleted without a row moving -- hence a line each one catches alone.
     #[test]
     fn mounts_drop_pseudo_filesystems_and_duplicate_devices() {
         let mounts = parse_mounts(
@@ -590,10 +583,10 @@ mod tests {
              tank/set2 /tank/sub zfs rw 0 0\n",
         );
         // /snap/... is a real device holding a pseudo filesystem: only the
-        // fstype list rejects it, and a squashfs per snap would otherwise add a
-        // full copy of each one to the machine's disk total.
-        // /mnt/scratch is the mirror image -- a real filesystem whose source is
-        // not a path -- and only the device check rejects that.
+        // fstype list rejects it, and a squashfs per snap would add a full copy
+        // of each to the disk total. /mnt/scratch is the mirror image, a real
+        // filesystem whose source is not a path, caught only by the device
+        // check.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
     }
 
@@ -620,19 +613,18 @@ mod tests {
 mod crosscheck {
     use super::*;
 
-    /// The accuracy rule, checked against the tools it names rather than
-    /// printed for a human to check. Constructed /proc text can only show the
-    /// arithmetic is right; it cannot show the right field was read, and
-    /// reading the wrong field is the bug this agent exists to fix.
+    /// The accuracy rule, checked against the tools it names. Constructed
+    /// /proc text can only show the arithmetic is right; it cannot show the
+    /// right field was read, and reading the wrong field is the bug this agent
+    /// exists to fix.
     ///
-    /// Every figure `free` and `df` also report is compared here, swap
-    /// included. A metric left out is a metric whose reading nothing checks,
-    /// and swap spent its whole life outside this test being a fifth low.
+    /// Every figure `free` and `df` report is compared, swap included: a metric
+    /// left out is a metric whose reading nothing checks, and swap spent its
+    /// whole life outside this test running a fifth low.
     ///
-    /// The tolerance covers the machine moving between the two readings, and it
-    /// is an order of magnitude below every wrong answer: on this box the root
-    /// reserve `df` excludes is gigabytes, and the page cache sysinfo counts as
-    /// used is gigabytes. Sixty-four mebibytes tells them apart with room over.
+    /// The tolerance covers the machine moving between the two readings and is
+    /// an order of magnitude below every wrong answer -- the root reserve `df`
+    /// excludes and the page cache sysinfo counts as used are both gigabytes.
     ///
     /// Still prints, so `cargo test crosscheck -- --nocapture` reads the same.
     #[test]
@@ -651,19 +643,18 @@ mod crosscheck {
             assert!(drift < TOLERANCE, "{what}: ours={ours} theirs={theirs} drift={drift}");
         };
 
-        // free(1) row "Mem:": total, used, ... -- its used column is
-        // total - available, the same question MemAvailable answers.
+        // free(1) row "Mem:": its used column is total - available, the same
+        // question MemAvailable answers.
         let free = tool("free", &["-b"]);
         let mut row = free.lines().nth(1).expect("free prints a Mem: row").split_whitespace().skip(1);
         let parse = |v: Option<&str>| v.expect("free column").parse::<u64>().expect("a byte count");
         assert_eq!(m.mem_total, parse(row.next()), "MemTotal is not free's total");
         close(m.mem_used, parse(row.next()), "memory");
 
-        // free(1) row "Swap:": total, used, free. Held to a far tighter
-        // tolerance than memory, because the miscount it exists to catch --
-        // subtracting SwapCached -- was 6 MiB on the box that found it, and the
-        // memory tolerance would have waved it straight through. Swap moves
-        // slowly enough between two readings that a megabyte is room to spare.
+        // free(1) row "Swap:": total, used, free. A far tighter tolerance than
+        // memory, because the miscount it catches -- subtracting SwapCached --
+        // is single-digit MiB, which the memory tolerance would wave through.
+        // Swap moves slowly enough that a megabyte is room to spare.
         const SWAP_TOLERANCE: u64 = 1024 * 1024;
         let mut row = free.lines().nth(2).expect("free prints a Swap: row").split_whitespace().skip(1);
         assert_eq!(m.swap_total, parse(row.next()), "SwapTotal is not free's swap total");
@@ -671,9 +662,9 @@ mod crosscheck {
         let drift = m.swap_used.abs_diff(theirs);
         assert!(drift < SWAP_TOLERANCE, "swap: ours={} theirs={theirs} drift={drift}", m.swap_used);
 
-        // df(1) counts the root reserve as free, which is f_bfree and not
-        // f_bavail. Compared against one filesystem, because df is being asked
-        // about one and the metric sums every mount.
+        // df(1) counts the root reserve as free, which is f_bfree, not
+        // f_bavail. Compared against one filesystem, because df is asked about
+        // one while the metric sums every mount.
         let (disk_total, disk_used) = disk_usage(&["/".to_owned()]);
         let df = tool("df", &["-B1", "--output=size,used", "/"]);
         let mut row = df.lines().nth(1).expect("df prints a data row").split_whitespace();
@@ -682,7 +673,7 @@ mod crosscheck {
         close(disk_used, parse(row.next()), "disk");
     }
 
-    /// Missing tools are a failure, not a reason to pass quietly: this test is
+    /// A missing tool is a failure, not a reason to pass quietly: this test is
     /// worth nothing if it can skip the comparison it exists for.
     fn tool(program: &str, args: &[&str]) -> String {
         let out = std::process::Command::new(program)
