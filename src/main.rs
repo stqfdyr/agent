@@ -19,6 +19,10 @@ struct Args {
     server: String,
     token: String,
     interval: u64,
+    /// Set to talk to a hub that only answers plain HTTP -- a hub reached at
+    /// ip:port with no TLS in front. Off by default, because the token then
+    /// travels in the clear.
+    insecure: bool,
 }
 
 fn usage() -> ! {
@@ -28,14 +32,17 @@ fn usage() -> ! {
          Options:\n  \
            --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
            --token <token>      Node token from the hub panel\n  \
-           --interval <secs>    Report interval (default 1)\n",
+           --interval <secs>    Report interval (default 1)\n  \
+           --insecure           Allow plain ws:// to a remote hub; the token\n  \
+                                travels in the clear. Only for a hub reached\n  \
+                                at ip:port with no TLS in front.\n",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval) = (None, None, 1u64);
+    let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -43,28 +50,38 @@ fn parse_args() -> Result<Args> {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or(1),
+            "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
-    Ok(Args { server, token, interval: interval.clamp(1, 3600) })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
 /// an Authorization header rather than the query string, so it stays out of
 /// reverse-proxy access logs.
-fn ws_url(server: &str) -> Result<String> {
+///
+/// `insecure` is the operator saying the hub has no TLS -- a default ip:port
+/// deployment. It both allows plain ws:// to a remote hub and stops a bare
+/// host from being upgraded to TLS the hub does not speak; without the second
+/// half the flag would connect to a port that never completes a handshake.
+fn ws_url(server: &str, insecure: bool) -> Result<String> {
     let base = server.trim_end_matches('/');
+    let scheme = if insecure { "ws" } else { "wss" };
     let base = match base.split_once("://") {
         Some(("https", rest)) => format!("wss://{rest}"),
         Some(("http", rest)) => format!("ws://{rest}"),
         Some(("wss" | "ws", _)) => base.to_owned(),
-        _ => format!("wss://{base}"),
+        _ => format!("{scheme}://{base}"),
     };
-    if base.starts_with("ws://") && !is_loopback(&base) {
-        bail!("refusing plaintext ws:// to a remote hub; the token would travel in the clear");
+    if base.starts_with("ws://") && !insecure && !is_loopback(&base) {
+        bail!(
+            "refusing plaintext ws:// to a remote hub; the token would travel in the clear. \
+             Pass --insecure if that hub really has no TLS"
+        );
     }
     Ok(format!("{base}/api/agent/ws"))
 }
@@ -103,7 +120,7 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = parse_args()?;
-    let url = ws_url(&args.server)?;
+    let url = ws_url(&args.server, args.insecure)?;
     let mut collector = Collector::new();
     let mut wait = 0u64;
 
@@ -322,15 +339,30 @@ mod tests {
 
     #[test]
     fn ws_url_upgrades_scheme_and_refuses_plaintext_to_remote() {
-        assert_eq!(ws_url("https://hub.example.com/").unwrap(), "wss://hub.example.com/api/agent/ws");
-        assert_eq!(ws_url("http://127.0.0.1:8080").unwrap(), "ws://127.0.0.1:8080/api/agent/ws");
+        assert_eq!(ws_url("https://hub.example.com/", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert_eq!(ws_url("http://127.0.0.1:28080", false).unwrap(), "ws://127.0.0.1:28080/api/agent/ws");
         // A bare host defaults to TLS rather than leaking the token.
-        assert!(ws_url("hub.example.com").unwrap().starts_with("wss://"));
-        assert!(ws_url("http://hub.example.com").is_err());
+        assert!(ws_url("hub.example.com", false).unwrap().starts_with("wss://"));
+        assert!(ws_url("http://hub.example.com", false).is_err());
         // Bracketed IPv6 loopback is not remote.
-        assert_eq!(ws_url("http://[::1]:8080").unwrap(), "ws://[::1]:8080/api/agent/ws");
+        assert_eq!(ws_url("http://[::1]:28080", false).unwrap(), "ws://[::1]:28080/api/agent/ws");
         // No token anywhere in the URL: it rides in a header instead.
-        assert!(!ws_url("https://hub.example.com").unwrap().contains("token"));
+        assert!(!ws_url("https://hub.example.com", false).unwrap().contains("token"));
+    }
+
+    /// `--insecure` is for a hub reached at ip:port with no TLS: it allows the
+    /// plaintext hop, and a bare host stops meaning TLS -- otherwise the flag
+    /// would dial wss:// at a port that cannot answer it.
+    #[test]
+    fn insecure_allows_plaintext_to_a_remote_hub_and_stops_upgrading_bare_hosts() {
+        assert_eq!(
+            ws_url("http://203.0.113.10:28080", true).unwrap(),
+            "ws://203.0.113.10:28080/api/agent/ws"
+        );
+        assert_eq!(ws_url("203.0.113.10:28080", true).unwrap(), "ws://203.0.113.10:28080/api/agent/ws");
+        // An explicit https:// hub stays on TLS: the flag permits plaintext,
+        // it does not force it.
+        assert_eq!(ws_url("https://hub.example.com", true).unwrap(), "wss://hub.example.com/api/agent/ws");
     }
 
     #[tokio::test]
