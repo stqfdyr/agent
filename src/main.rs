@@ -122,20 +122,30 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
     )
 }
 
-/// A write with a deadline, given the same budget as the silence it would
-/// otherwise hide.
+/// A write with a deadline, spending what is left of the silence budget.
 ///
 /// Reads and writes share one `select!` loop, so a socket that never drains
 /// stops everything: the watchdog below stops being polled, and the frame that
 /// would prove the path alive is never read. The kernel gives up on such a
 /// socket after tcp_retries2, about a quarter of an hour.
 ///
+/// The budget is what remains until the watchdog would have fired, not a fresh
+/// [`HUB_SILENCE`]: a write entering a stall at the end of a quiet stretch
+/// would otherwise cost both in turn, and 90 + 90 lands past the 120s at which
+/// the hub gives up -- the very thing the watchdog is sized to stay under. A
+/// budget squeezed to nothing fails the write, which ends the session exactly
+/// as the watchdog would have.
+///
 /// A timed-out write leaves a half-written frame in the stream. Every caller
 /// ends the session on the error, so that frame dies with the socket.
-async fn send(ws: &mut (impl Sink<Message, Error = WsError> + Unpin), m: Message) -> Result<()> {
-    tokio::time::timeout(HUB_SILENCE, ws.send(m))
+async fn send(
+    ws: &mut (impl Sink<Message, Error = WsError> + Unpin),
+    m: Message,
+    budget: Duration,
+) -> Result<()> {
+    tokio::time::timeout(budget, ws.send(m))
         .await
-        .map_err(|_| anyhow!("write stalled for {}s", HUB_SILENCE.as_secs()))?
+        .map_err(|_| anyhow!("write stalled for {}s", budget.as_secs()))?
         .context("write")
 }
 
@@ -147,17 +157,23 @@ async fn main() -> Result<()> {
     let mut wait = 0u64;
 
     loop {
-        let started = Instant::now();
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval).await {
+        // Set by `session` once the handshake is through, so a connect that
+        // never completed cannot pass its CONNECT_DEADLINE off as a session
+        // that ran. `None` is the shape of "never connected", which is what
+        // the doubling branch below is for.
+        let mut connected = None;
+        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
             eprintln!("session ended: {e:#}");
         }
-        wait = reconnect_wait(wait, started.elapsed());
+        wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 }
 
 /// How long to wait before reconnecting, from the previous wait and how long
-/// the session that just ended had lasted.
+/// the session that just ended had lasted -- measured from the handshake, not
+/// from the attempt: a peer that swallows a connect for the whole
+/// [`CONNECT_DEADLINE`] has proved nothing and gets no credit for the wait.
 ///
 /// A session that reported for a while proves the hub reachable and the token
 /// good, so whatever ended it was a restart or a network blink -- one second,
@@ -201,7 +217,13 @@ const MAX_MESSAGE: usize = 64 * 1024;
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
 /// One connection: say hello, then report until the socket dies.
-async fn session(url: &str, token: &str, collector: &mut Collector, interval: u64) -> Result<()> {
+async fn session(
+    url: &str,
+    token: &str,
+    collector: &mut Collector,
+    interval: u64,
+    connected: &mut Option<Instant>,
+) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
@@ -214,8 +236,9 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))?
         .context("connect")?;
     eprintln!("connected");
+    *connected = Some(Instant::now());
 
-    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?)).await?;
+    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?), HUB_SILENCE).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -227,7 +250,8 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
-                if let Err(e) = send(&mut ws, notify("report", m)).await { break Err(e); }
+                let budget = HUB_SILENCE.saturating_sub(last_frame.elapsed());
+                if let Err(e) = send(&mut ws, notify("report", m), budget).await { break Err(e); }
             }
             // Built afresh each pass from the last frame, so silence costs
             // exactly HUB_SILENCE. A timer polled every HUB_SILENCE / 3 spent
@@ -238,7 +262,8 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
                 break Err(anyhow!("no frame from the hub in {}s", HUB_SILENCE.as_secs()));
             }
             Some(msg) = result_rx.recv() => {
-                if let Err(e) = send(&mut ws, msg).await { break Err(e); }
+                let budget = HUB_SILENCE.saturating_sub(last_frame.elapsed());
+                if let Err(e) = send(&mut ws, msg, budget).await { break Err(e); }
             }
             incoming = ws.next() => {
                 // Any frame proves the path is still there, the hub's
@@ -381,11 +406,15 @@ mod tests {
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
-        // Nothing on the other end: double to the ceiling and stay there.
+        // Nothing on the other end: double to the ceiling and stay there. Zero
+        // is what the caller passes for a connect that never finished -- the
+        // black hole spends CONNECT_DEADLINE and reports no session at all. A
+        // second of it would mean the attempt was being timed, which is how
+        // 120s of connecting used to reset the climb.
         let mut wait = 0;
         let climb: Vec<u64> = (0..8)
             .map(|_| {
-                wait = reconnect_wait(wait, Duration::from_secs(1));
+                wait = reconnect_wait(wait, Duration::ZERO);
                 wait
             })
             .collect();
@@ -480,9 +509,15 @@ mod tests {
     /// visible from this file.
     ///
     /// This reads as the whole detection time only because the watchdog sleeps
-    /// to a deadline. While it was an interval polled every HUB_SILENCE / 3,
-    /// the worst case was 90 + 30 = 120s -- the hub's timeout exactly, so the
-    /// property below was false while its assertion stayed green.
+    /// to a deadline and a write spends what is left of that same deadline.
+    /// While the watchdog was an interval polled every HUB_SILENCE / 3, the
+    /// worst case was 90 + 30 = 120s -- the hub's timeout exactly.
+    ///
+    /// Neither of those two structures is asserted here, and putting either
+    /// back leaves this file green: proving it takes a paused clock and a
+    /// socket that accepts nothing, which is more scaffolding than the two
+    /// lines it would guard. What holds them is that both read their deadline
+    /// from `last_frame` rather than keeping a clock of their own.
     #[test]
     fn the_agent_gives_up_on_a_silent_hub_before_the_hub_gives_up_on_it() {
         assert!(

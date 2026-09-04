@@ -399,6 +399,12 @@ fn parse_mounts(text: &str) -> Vec<String> {
 /// `used = total - free`, exactly what df reports. `total - available` charges
 /// ext4's 5% root reserve to the user and shows a fresh disk several percent
 /// full.
+///
+/// Blocking, on the thread that also runs the reporting loop. What keeps that
+/// from mattering is [`SKIP_FSTYPES`] upstream: the mounts that hang in D
+/// state until a server answers -- nfs, cifs, ceph, fuse -- never reach this
+/// call. Taking an entry off that list would hand a dead NAS the ability to
+/// freeze the agent, watchdog included, and no test would say so.
 fn disk_usage(mounts: &[String]) -> (u64, u64) {
     let mut total = 0u64;
     let mut used = 0u64;
