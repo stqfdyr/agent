@@ -20,7 +20,8 @@
 curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --token <token>
 ```
 
-安装脚本识别 systemd 与 OpenRC，token 写入 `/etc/monitor/agent.env`（0600）。
+安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
+`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
 
 ## 运行
 
