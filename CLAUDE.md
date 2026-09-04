@@ -43,7 +43,7 @@
 ## 常用命令
 
 ```bash
-cargo test                # 15 个
+cargo test                # 17 个
 cargo clippy --all-targets
 cargo test crosscheck -- --nocapture   # 采集值与 free / df 自动比对，顺带打印
 ```

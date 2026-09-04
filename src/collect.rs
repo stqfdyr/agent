@@ -7,9 +7,11 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-/// Interface name prefixes never counted as real traffic.
+/// Interfaces that are neither this machine's traffic nor its identity:
+/// loopback, the container and VM networks, and the tunnels whose bytes reach
+/// the wire a second time inside their carrier.
 const SKIP_IFACES: &[&str] = &[
-    "lo", "docker", "veth", "br-", "virbr", "vmbr", "tap", "tun", "cni", "flannel", "podman", "fwbr", "fwpr",
+    "lo", "docker", "veth", "br-", "virbr", "tap", "tun", "wg", "cni", "flannel", "podman", "fwbr", "fwpr",
     "kube", "cali", "nerdctl", "zt",
 ];
 
@@ -38,8 +40,19 @@ const SKIP_FSTYPES: &[&str] = &[
     "efivarfs",
     "nsfs",
     "overlay",
-    "fuse.lxcfs",
+    "fuse",
     "rpc_pipefs",
+    // Someone else's disk. `//server/share` passes the device check that keeps
+    // `server:/export` out, so only the type list stops a NAS from landing in
+    // this machine's capacity. Every spelling needs its own entry: the flavour
+    // rule below matches on a dot, so "nfs" does not cover "nfs4".
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "ceph",
+    "glusterfs",
+    "9p",
 ];
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -282,8 +295,10 @@ fn uptime() -> u64 {
 /// the public ones; behind NAT the v4 is private, which is what this machine
 /// actually holds -- nothing is asked of any outside service.
 ///
-/// Filtered by the same prefix list that keeps virtual devices out of the
-/// traffic counters, so a docker bridge cannot pass for the machine's address.
+/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
+/// machine's address. Not by [`is_stacked`]: that one answers whether bytes
+/// were already counted lower down, and a bridge holding the host address is
+/// both stacked and this machine.
 fn addresses() -> (String, String) {
     let (mut v4, mut v6) = (String::new(), String::new());
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
@@ -299,7 +314,7 @@ fn addresses() -> (String, String) {
     (v4, v6)
 }
 
-/// Sums the kernel's lifetime byte counters over real interfaces.
+/// Sums the kernel's lifetime byte counters, one count per byte on the wire.
 fn net_totals() -> (u64, u64) {
     parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
 }
@@ -310,7 +325,7 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
     for line in text.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else { continue };
         let name = name.trim();
-        if skip_iface(name) {
+        if skip_iface(name) || is_stacked(name) {
             continue;
         }
         let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
@@ -324,6 +339,18 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
 
 fn skip_iface(name: &str) -> bool {
     SKIP_IFACES.iter().any(|p| name.starts_with(p))
+}
+
+/// Stacked on top of another interface: bonds, bridges, VLAN children. The
+/// kernel books one packet on both, so counting these doubles the traffic the
+/// hub bills.
+///
+/// A traffic rule only. These are the interfaces a host's own address most
+/// often sits on -- `vmbr0` on Proxmox, `bond0` where two ports are one link --
+/// and answering "are these bytes already counted" says nothing about whether
+/// an address is mine.
+fn is_stacked(name: &str) -> bool {
+    name.contains('.') || ["bond", "br", "vlan", "vmbr"].iter().any(|p| name.starts_with(p))
 }
 
 /// A pseudo filesystem, named outright or as a flavour of one -- `fuse.lxcfs`
@@ -543,14 +570,42 @@ mod tests {
         assert_eq!(parse_sockstat("", ""), (0, 0));
     }
 
+    /// One byte on the wire, counted once. Every line but eth0 is that same
+    /// byte booked a second time: bond, bridge and VLAN are stacked over it,
+    /// and a tunnel's payload leaves inside a packet eth0 has already counted.
     #[test]
-    fn net_skips_virtual_interfaces() {
+    fn net_counts_a_wire_byte_once_however_many_devices_book_it() {
         let dev = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n\
                    eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
                      lo: 9999 1 0 0 0 0 0 0 9999 2 0 0 0 0 0 0\n\
               docker0: 5555 1 0 0 0 0 0 0 5555 2 0 0 0 0 0 0\n\
-                  wg0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n";
-        assert_eq!(parse_net_dev(dev), (1300, 2400));
+            veth9a1b2c: 5555 1 0 0 0 0 0 0 5555 2 0 0 0 0 0 0\n\
+                  wg0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+                 tun0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+                 tap0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+                bond0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+                  br0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+                vmbr0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+             eth0.100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+              vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(dev), (1000, 2000));
+    }
+
+    /// The two questions the interface name is asked, and why one list cannot
+    /// answer both: a bridge's bytes are a duplicate, a bridge's address is
+    /// this machine's only address.
+    #[test]
+    fn a_stacked_device_loses_its_bytes_but_keeps_its_address() {
+        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100"] {
+            assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
+            assert!(!skip_iface(name), "{name} is where a host address lives");
+        }
+        // Neither this machine's traffic nor its address: container networks,
+        // and tunnels whose payload leaves inside a packet eth0 counted.
+        for name in ["lo", "docker0", "veth9a1b2c", "br-6cd9538131d7", "virbr0", "wg0", "tun0", "tap0"] {
+            assert!(skip_iface(name), "{name} is not this machine");
+        }
+        assert!(!skip_iface("eth0") && !is_stacked("eth0"), "the wire itself is what gets counted");
     }
 
     #[test]
@@ -579,6 +634,8 @@ mod tests {
              /dev/vda1 /var/lib/bind ext4 rw 0 0\n\
              overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0\n\
              /dev/vdb1 /data xfs rw 0 0\n\
+             /mnt/disk1:/mnt/disk2 /pool fuse.mergerfs rw 0 0\n\
+             //nas/backup /mnt/nas cifs rw 0 0\n\
              tank/set1 /tank zfs rw 0 0\n\
              tank/set2 /tank/sub zfs rw 0 0\n",
         );
@@ -586,7 +643,13 @@ mod tests {
         // fstype list rejects it, and a squashfs per snap would add a full copy
         // of each to the disk total. /mnt/scratch is the mirror image, a real
         // filesystem whose source is not a path, caught only by the device
-        // check.
+        // check. //nas/backup and the mergerfs pool are a third shape: a
+        // source that passes for a device, holding either somebody else's
+        // disk or a second view of mounts already counted here. Only the
+        // fstype list keeps those out of this machine's capacity -- and only
+        // `fuse` as a whole covers the pool, since its flavour is one of the
+        // ones nobody thinks to list. A block device behind a fuse driver
+        // mounts as `fuseblk` and still counts.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
     }
 

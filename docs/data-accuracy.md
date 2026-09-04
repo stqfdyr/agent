@@ -112,7 +112,13 @@ used  = (f_blocks - f_bfree) * f_frsize    // f_bfree 是原始空闲块，含�
 
 `parse_mounts()` 读 `/proc/self/mounts`，然后：
 
-- 按 fstype 排除伪文件系统（tmpfs、proc、sysfs、overlay、squashfs……完整名单在 `SKIP_FSTYPES`）
+- 按 fstype 排除伪文件系统和**远端文件系统**（tmpfs、proc、sysfs、overlay、squashfs、
+  nfs、cifs、ceph、glusterfs、9p……完整名单在 `SKIP_FSTYPES`）。CIFS 的设备名 `//server/share`
+  以 `/` 开头，过得了下面那道设备检查，只有 fstype 名单拦得住——否则一台 50 GB 的 VPS 会因为挂了
+  个 NAS 显示 20 TB。NFS 一直没出事纯属巧合：`server:/export` 卡在设备名那道。名单按 `.` 分隔匹配
+  变体，所以 `nfs` 不覆盖 `nfs4`，两个都得写；反过来 `fuse` 一条就盖住 `fuse.sshfs`、
+  `fuse.mergerfs`、`fuse.lxcfs` 这些「没有本地块设备撑着」的挂载——真有块设备撑着的 fuse（ntfs-3g）
+  fstype 是 `fuseblk`，盖不到，仍然计入
 - 排除设备名不以 `/` 开头的（zfs 和 btrfs 例外，它们的「设备」是池名/子卷）
 - **按源设备去重**——同一块盘挂两次（bind mount、btrfs 子卷）只算一次
 - zfs 按池名去重（`tank/set1` 和 `tank/set2` 共享 `tank` 的空间）
@@ -164,7 +170,23 @@ user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的
 
 `net_rx_total` / `net_tx_total` 是**原样上报**的内核计数器，累加是 hub 的事，见 hub 仓库的 [traffic.md](https://github.com/stqfdyr/monitor/blob/main/docs/traffic.md)。
 
-网卡过滤：`SKIP_IFACES` 排除 lo、docker、veth、br-、virbr、tap、tun、cni 等前缀，写死在 `src/collect.rs`。
+### 网卡过滤
+
+口径是**同一份物理线上的字节只数一次**。两层规则，都写死在 `src/collect.rs`：
+
+- `SKIP_IFACES`——既不是本机流量、也不是本机身份的网卡：lo、docker、veth、br-、virbr、cni、
+  podman、kube 等前缀，加上 tun / tap / **wg**。隧道口是重复计数：`wg0` 上的 300 字节离开机器时，
+  是承载它的那个 UDP 包在 `eth0` 上再记一次。`wg` 漏了很久，而测试把这个双计当成正确结果断言了下来
+- `is_stacked()`——叠在别的网卡之上的设备：bond、br、vmbr、vlan 前缀，以及 `eth0.100` 这种带点的
+  VLAN 子接口。内核在下层和上层各记一次同一个包，两个都算就是双倍流量，而 hub 的配额是按这对
+  生涯计数器算的
+
+**只有流量过滤看 `is_stacked()`，取地址不看。** 「这些字节是不是已经数过」和「这个地址是不是我的」
+是两个问题：`vmbr0`（Proxmox）、`bond0` 往往正是持有主机管理地址的那块网卡，拿流量名单去挑地址，
+结果是 `Facts.ipv4` 为空、hub 拿不到节点地址。取地址只过 `SKIP_IFACES`。
+
+测试：`net_counts_a_wire_byte_once_however_many_devices_book_it` 和
+`a_stacked_device_loses_its_bytes_but_keeps_its_address`，后者把「一个名字被问了两个问题」直接钉住。
 
 ## 网络延迟
 
