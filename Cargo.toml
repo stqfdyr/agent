@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 license = "MIT"
 description = "Linux monitoring agent for the monitor hub"
