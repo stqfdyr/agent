@@ -5,13 +5,13 @@ mod collect;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use collect::Collector;
 
@@ -49,7 +49,7 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
-            "--interval" => interval = value().parse().unwrap_or(1),
+            "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
@@ -88,13 +88,18 @@ fn ws_url(server: &str, insecure: bool) -> Result<String> {
 
 /// IPv6 literals are bracketed, so the port cannot be split off at the first
 /// colon.
+///
+/// The host is parsed rather than prefix-matched: `127.attacker.example` is a
+/// name someone else resolves, and it begins with the loopback net. Anything
+/// that is not a literal loopback address falls to the plaintext refusal --
+/// including `::ffff:127.0.0.1`, which stays behind `--insecure`.
 fn is_loopback(url: &str) -> bool {
     let authority = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
     let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => authority.split(':').next().unwrap_or(""),
     };
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    host.parse::<std::net::IpAddr>().map_or(host == "localhost", |ip| ip.is_loopback())
 }
 
 #[derive(Deserialize)]
@@ -115,6 +120,23 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
     Message::Text(
         serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string().into(),
     )
+}
+
+/// A write with a deadline, given the same budget as the silence it would
+/// otherwise hide.
+///
+/// Reads and writes share one `select!` loop, so a socket that never drains
+/// stops everything: the watchdog below stops being polled, and the frame that
+/// would prove the path alive is never read. The kernel gives up on such a
+/// socket after tcp_retries2, about a quarter of an hour.
+///
+/// A timed-out write leaves a half-written frame in the stream. Every caller
+/// ends the session on the error, so that frame dies with the socket.
+async fn send(ws: &mut (impl Sink<Message, Error = WsError> + Unpin), m: Message) -> Result<()> {
+    tokio::time::timeout(HUB_SILENCE, ws.send(m))
+        .await
+        .map_err(|_| anyhow!("write stalled for {}s", HUB_SILENCE.as_secs()))?
+        .context("write")
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -193,31 +215,30 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
         .context("connect")?;
     eprintln!("connected");
 
-    ws.send(notify("hello", serde_json::to_value(collector.facts())?)).await?;
+    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Its own timer, not the report tick, which --interval can stretch to an hour.
-    let mut watchdog = tokio::time::interval(HUB_SILENCE / 3);
-    watchdog.tick().await; // The first tick completes immediately.
     let mut last_frame = Instant::now();
 
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
-                if let Err(e) = ws.send(notify("report", m)).await { break Err(e.into()); }
+                if let Err(e) = send(&mut ws, notify("report", m)).await { break Err(e); }
             }
-            _ = watchdog.tick() => {
-                let quiet = last_frame.elapsed();
-                if quiet > HUB_SILENCE {
-                    break Err(anyhow!("no frame from the hub in {}s", quiet.as_secs()));
-                }
+            // Built afresh each pass from the last frame, so silence costs
+            // exactly HUB_SILENCE. A timer polled every HUB_SILENCE / 3 spent
+            // a whole extra tick before firing, which put the worst case at
+            // the hub's own timeout instead of under it. Not the report tick:
+            // --interval can stretch that to an hour.
+            _ = tokio::time::sleep(HUB_SILENCE.saturating_sub(last_frame.elapsed())) => {
+                break Err(anyhow!("no frame from the hub in {}s", HUB_SILENCE.as_secs()));
             }
             Some(msg) = result_rx.recv() => {
-                if let Err(e) = ws.send(msg).await { break Err(e.into()); }
+                if let Err(e) = send(&mut ws, msg).await { break Err(e); }
             }
             incoming = ws.next() => {
                 // Any frame proves the path is still there, the hub's
@@ -234,7 +255,9 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
                             }
                         }
                     }
-                    Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }
+                    // Ping included: tungstenite queues the pong itself and
+                    // writes it on the next read. A manual reply replaces that
+                    // queued frame with a copy of itself.
                     Some(Ok(_)) => {}
                     Some(Err(e)) => break Err(e.into()),
                     None => break Ok(()),
@@ -249,13 +272,28 @@ async fn session(url: &str, token: &str, collector: &mut Collector, interval: u6
     result
 }
 
+/// How many probe loops the hub may have running at once.
+///
+/// A task serialises to about forty bytes, so one [`MAX_MESSAGE`] frame asks
+/// for some fifteen hundred of them; at the five-second floor below that is a
+/// few hundred outbound connects a second, to addresses the hub chose. The
+/// agent runs on someone else's VPS, where that reads as a port scan and works
+/// as an amplifier. A hub that is compromised or merely buggy is the whole
+/// threat model, so the list gets a ceiling rather than trust.
+const MAX_PING_TASKS: usize = 64;
+
 /// Replaces the running probe loops with the hub's current task list, leaving
 /// unchanged tasks alone so their timers survive a push.
 fn respawn_ping_tasks(
     running: &mut Vec<(PingTask, tokio::task::JoinHandle<()>)>,
-    wanted: Vec<PingTask>,
+    mut wanted: Vec<PingTask>,
     tx: &mpsc::Sender<Message>,
 ) {
+    if wanted.len() > MAX_PING_TASKS {
+        // Dropping probes in silence is an hour of wondering which ones ran.
+        eprintln!("hub asked for {} ping tasks, running {MAX_PING_TASKS}", wanted.len());
+        wanted.truncate(MAX_PING_TASKS);
+    }
     running.retain(|(task, handle)| {
         let keep =
             wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
@@ -298,20 +336,43 @@ fn respawn_ping_tasks(
 /// cost is that a link whose genuine round trip exceeds this reads unreachable.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(900);
 
-/// Round trip of a TCP handshake to the target, in milliseconds; -1 when the
-/// SYN went unanswered inside [`HANDSHAKE_DEADLINE`].
+/// How many of a name's addresses one probe will try.
+///
+/// Every dead one costs a [`HANDSHAKE_DEADLINE`] before the next is reached,
+/// and a probe may not outlast the five-second floor on its own interval.
+const MAX_PING_ADDRS: usize = 3;
+
+/// Round trip of a TCP handshake to the target, in milliseconds; -1 when no
+/// address answered inside [`HANDSHAKE_DEADLINE`].
 ///
 /// The name is resolved before the clock starts: `TcpStream::connect` on a
 /// hostname resolves first and connects second, folding the resolver's latency
 /// into every sample.
 async fn tcp_ping(target: &str) -> i32 {
-    let Ok(mut addresses) = tokio::net::lookup_host(target).await else { return -1 };
-    let Some(address) = addresses.next() else { return -1 };
-    let started = std::time::Instant::now();
-    match tokio::time::timeout(HANDSHAKE_DEADLINE, TcpStream::connect(address)).await {
-        Ok(Ok(_)) => started.elapsed().as_millis().min(i32::MAX as u128) as i32,
-        _ => -1,
+    let Ok(addresses) = tokio::net::lookup_host(target).await else { return -1 };
+    handshake(addresses).await
+}
+
+/// The first address that completes a handshake, in milliseconds.
+///
+/// The clock restarts on each address, so a dead one contributes nothing to
+/// the reading. Summing them would report the wait as latency, which is what
+/// [`HANDSHAKE_DEADLINE`] exists to prevent.
+///
+/// Any failure moves on, refusals included. glibc hands back the v6 address
+/// first, and on a box whose v6 has no route -- or a route into a black hole
+/// -- stopping at the first address reads unreachable forever while the
+/// target answers over v4. Which family failed is not worth an errno: a
+/// refusal costs a millisecond, and the black hole is the case that has to
+/// move on.
+async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32 {
+    for address in addresses.take(MAX_PING_ADDRS) {
+        let started = std::time::Instant::now();
+        if let Ok(Ok(_)) = tokio::time::timeout(HANDSHAKE_DEADLINE, TcpStream::connect(address)).await {
+            return started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        }
     }
+    -1
 }
 
 #[cfg(test)]
@@ -346,6 +407,12 @@ mod tests {
         assert!(ws_url("http://hub.example.com", false).is_err());
         // Bracketed IPv6 loopback is not remote.
         assert_eq!(ws_url("http://[::1]:28080", false).unwrap(), "ws://[::1]:28080/api/agent/ws");
+        assert_eq!(ws_url("http://localhost:28080", false).unwrap(), "ws://localhost:28080/api/agent/ws");
+        // A name that merely starts like the loopback net is somebody else's
+        // machine: the host is parsed, not prefix-matched.
+        assert!(ws_url("http://127.attacker.example/", false).is_err());
+        // Fail closed: a mapped literal is not read as loopback either.
+        assert!(ws_url("http://[::ffff:127.0.0.1]:28080", false).is_err());
         // No token anywhere in the URL: it rides in a header instead.
         assert!(!ws_url("https://hub.example.com", false).unwrap().contains("token"));
     }
@@ -379,6 +446,20 @@ mod tests {
         // A target that will not resolve comes back unreachable rather than
         // taking the probe down.
         assert_eq!(tcp_ping("127.0.0.1:99999").await, -1, "not a parseable target");
+
+        // A name whose first address is dead: the shape of a dual-stack target
+        // on a box whose v6 goes nowhere. The probe moves on instead of
+        // calling a reachable target unreachable for good.
+        let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(handshake([dead, addr].into_iter()).await >= 0, "a dead address must not end the probe");
+        assert_eq!(handshake([dead, dead].into_iter()).await, -1, "every address failed");
+        // Past the ceiling the rest are not tried: a name with a long address
+        // list would otherwise hold a probe past its own interval.
+        assert_eq!(
+            handshake([dead, dead, dead, addr].into_iter()).await,
+            -1,
+            "a fourth address is not tried"
+        );
     }
 
     /// The deadline is the whole mechanism: it has to land under the kernel's
@@ -397,6 +478,11 @@ mod tests {
     /// The hub pings every 30s and drops an agent silent for 120s (its
     /// SILENCE). Both ends of this window are load-bearing and neither is
     /// visible from this file.
+    ///
+    /// This reads as the whole detection time only because the watchdog sleeps
+    /// to a deadline. While it was an interval polled every HUB_SILENCE / 3,
+    /// the worst case was 90 + 30 = 120s -- the hub's timeout exactly, so the
+    /// property below was false while its assertion stayed green.
     #[test]
     fn the_agent_gives_up_on_a_silent_hub_before_the_hub_gives_up_on_it() {
         assert!(
@@ -404,10 +490,6 @@ mod tests {
             "past the hub's own timeout the agent stops being what recovers the connection"
         );
         assert!(HUB_SILENCE > Duration::from_secs(60), "two lost heartbeats are a blip, not a dead link");
-        assert!(
-            HUB_SILENCE / 3 <= Duration::from_secs(30),
-            "checking less often than the hub pings would round the window up by a whole heartbeat"
-        );
     }
 
     #[test]
@@ -441,5 +523,11 @@ mod tests {
         respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
         assert!(!running[0].1.is_finished(), "a zero interval must be clamped, not panic the probe");
+
+        // One 64 KiB frame is worth some fifteen hundred of these. The agent
+        // runs what it will run and says so, rather than trusting the count.
+        let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
+        respawn_ping_tasks(&mut running, flood, &tx);
+        assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
     }
 }
