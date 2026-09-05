@@ -125,6 +125,17 @@ used  = (f_blocks - f_bfree) * f_frsize    // f_bfree 是原始空闲块，含�
 
 不去重的话，一台有 bind mount 的机器硬盘容量会翻倍。
 
+**同一个挂载点出现多次时只认最后一条。** `/proc/self/mounts` 按挂载顺序排，而路径解析走的是最上面
+那层——`statvfs` 回答的就是它。被盖住的那条仍然列在表里，收下它等于拿上层的数字冒充下层的文件系统。
+这不是理论：hub 的 `install.sh` 给 unit 加了 `ProtectHome=yes`，systemd 的实现是在 `/home` 上盖一层
+tmpfs（默认内存的一半）。在一台 `/home` 是独立分区的机器上，改之前 `disk_total` 多出几百 MB 到几 GB 的
+RAM 盘、`disk_used` 少掉 `/home` 的全部用量，而 `cargo test crosscheck` 在开发者的 shell 里跑、没有那层
+namespace，**结构上看不见这件事**。
+
+修完之后 `/home` 是**不计入**（不再冒充），所以和 `df` 仍然差一块。这是 hub 那边定的取舍：加固不动，
+agent 启动时用 `shadowed_mounts()` 打一行说明是哪个挂载点没算——见 hub 仓库 `decisions.md` 的
+「ProtectHome 与磁盘口径」。测试：`a_shadowed_filesystem_is_not_counted_as_the_one_mounted_over_it`。
+
 测试：`mounts_drop_pseudo_filesystems_and_duplicate_devices`。样本里刻意留了两行只被其中一道检查
 挡住的挂载（`/dev/loop0 … squashfs` 只有 fstype 名单拦得住，`none … ext4` 只有设备名检查拦得住）
 ——否则两道检查互为备份，删掉任何一道测试都照样绿。
@@ -175,8 +186,19 @@ user 和 nice 的时间，再加一遍就是重复计算，会把跑虚拟化的
 口径是**同一份物理线上的字节只数一次**。两层规则，都写死在 `src/collect.rs`：
 
 - `SKIP_IFACES`——既不是本机流量、也不是本机身份的网卡：lo、docker、veth、br-、virbr、cni、
-  podman、kube 等前缀，加上 tun / tap / **wg**。隧道口是重复计数：`wg0` 上的 300 字节离开机器时，
-  是承载它的那个 UDP 包在 `eth0` 上再记一次。`wg` 漏了很久，而测试把这个双计当成正确结果断言了下来
+  podman、kube 等前缀，加上 tun / tap / **wg** / **tailscale**。隧道口是重复计数：`wg0` 上的 300 字节
+  离开机器时，是承载它的那个 UDP 包在 `eth0` 上再记一次。`wg` 漏了很久，而测试把这个双计当成正确
+  结果断言了下来。**`tailscale` 是同一个洞的第二次**——Tailscale 就是 WireGuard，只是它的口叫
+  `tailscale0` 不叫 `wg0`，前缀名单一个字都对不上，于是装了 Tailscale 的节点上报的总流量是真实值的
+  两倍。2026-09-05 补进名单
+
+  名单法会继续漏（`ppp0` 就悬着：PPPoE 是叠在 `eth0` 上的重复计数，而 LTE/串口拨号的 `ppp0` 没有
+  承载网卡，把它加进名单会让那种机器的流量整个归零，所以没加）。内核其实知道答案——真网卡在
+  `/sys/class/net/<name>/device` 下有东西，隧道和虚拟口没有——但**认错一块真网卡是丢掉一台机器的全部
+  流量，比双计更糟**，换过去之前要先对整个机队的网卡验一遍。`collect.rs` 的 `ponytail:` 标记记着这笔账
+
+  切换名单的一个副作用：节点的 `net_rx_total` 会一次性变小。这不违反 hub 的第一条铁律——`accumulate`
+  看到计数器变小会走「重新对齐」分支，delta 记 0、基线下移，总流量不回退，只是从此不再多算
 - `is_stacked()`——叠在别的网卡之上的设备：bond、br、vmbr、vlan 前缀，以及 `eth0.100` 这种带点的
   VLAN 子接口。内核在下层和上层各记一次同一个包，两个都算就是双倍流量，而 hub 的配额是按这对
   生涯计数器算的

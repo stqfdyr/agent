@@ -10,9 +10,36 @@ use serde::Serialize;
 /// Interfaces that are neither this machine's traffic nor its identity:
 /// loopback, the container and VM networks, and the tunnels whose bytes reach
 /// the wire a second time inside their carrier.
+///
+/// `tailscale` belongs to the tunnel half for the same reason `wg` does -- it is
+/// WireGuard under another name, and its interface is not called `wg0`. That one
+/// went missing long enough for the tests to assert the double count as correct
+/// (docs/data-accuracy.md), which is what a list of names buys.
+///
+/// ponytail: a name list, so the next tunnel is missed too. The kernel knows the
+/// answer -- a real NIC has /sys/class/net/<name>/device and a virtual one does
+/// not -- but a card that goes missing from that test loses a node's whole
+/// traffic, where a name that goes missing only doubles it. Worth the swap only
+/// once it has been checked against every card in the fleet.
 const SKIP_IFACES: &[&str] = &[
-    "lo", "docker", "veth", "br-", "virbr", "tap", "tun", "wg", "cni", "flannel", "podman", "fwbr", "fwpr",
-    "kube", "cali", "nerdctl", "zt",
+    "lo",
+    "docker",
+    "veth",
+    "br-",
+    "virbr",
+    "tap",
+    "tun",
+    "wg",
+    "tailscale",
+    "cni",
+    "flannel",
+    "podman",
+    "fwbr",
+    "fwpr",
+    "kube",
+    "cali",
+    "nerdctl",
+    "zt",
 ];
 
 /// Pseudo/virtual filesystems that must not count toward disk totals.
@@ -370,15 +397,29 @@ fn real_mount_points() -> Vec<String> {
     parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
 }
 
+fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            (f.len() >= 3).then(|| (f[0], f[1], f[2]))
+        })
+        .collect()
+}
+
 fn parse_mounts(text: &str) -> Vec<String> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
-    for line in text.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 3 {
+    let rows = mount_rows(text);
+    for (i, &(dev, mount, fstype)) in rows.iter().enumerate() {
+        // The table is in mount order and a path resolves to the last mount on
+        // it, which is the one statvfs below will answer for. An earlier entry
+        // for the same point is still listed but no longer reachable: the hub's
+        // install.sh runs this agent under ProtectHome=yes, so on a box where
+        // /home is its own filesystem its row sits under a tmpfs, and counting
+        // that row books the tmpfs's size as /home's.
+        if rows[i + 1..].iter().any(|(_, m, _)| *m == mount) {
             continue;
         }
-        let (dev, mount, fstype) = (f[0], f[1], f[2]);
         if skip_fstype(fstype) {
             continue;
         }
@@ -394,6 +435,30 @@ fn parse_mounts(text: &str) -> Vec<String> {
         out.push(mount.replace("\\040", " "));
     }
     out
+}
+
+/// Mount points where a real filesystem sits under something this agent does not
+/// count, so `statvfs` answers for the layer on top and the one below is missing
+/// from the totals entirely.
+///
+/// The hub's `install.sh` unit sets `ProtectHome=yes`, which mounts a tmpfs over
+/// /home. Where /home is its own filesystem, `df` on the host and the panel then
+/// disagree by the whole of it -- the caliber rule broken with nothing to say so.
+/// Printed once at startup, because the alternative is reading it off the numbers.
+pub fn shadowed_mounts(text: &str) -> Vec<String> {
+    let rows = mount_rows(text);
+    rows.iter()
+        .enumerate()
+        .filter(|(i, (dev, mount, fstype))| {
+            dev.starts_with('/')
+                && !skip_fstype(fstype)
+                && rows[i + 1..]
+                    .iter()
+                    .find(|(_, m, _)| m == mount)
+                    .is_some_and(|(_, _, top)| skip_fstype(top))
+        })
+        .map(|(_, (_, mount, _))| mount.replace("\\040", " "))
+        .collect()
 }
 
 /// `used = total - free`, exactly what df reports. `total - available` charges
@@ -579,6 +644,10 @@ mod tests {
     /// One byte on the wire, counted once. Every line but eth0 is that same
     /// byte booked a second time: bond, bridge and VLAN are stacked over it,
     /// and a tunnel's payload leaves inside a packet eth0 has already counted.
+    ///
+    /// `tailscale0` is in the list because it is the same tunnel as `wg0` under
+    /// a name the list did not have -- and this file's own history is a tunnel
+    /// missing from the list long enough for a test to assert the double count.
     #[test]
     fn net_counts_a_wire_byte_once_however_many_devices_book_it() {
         let dev = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n\
@@ -587,6 +656,7 @@ mod tests {
               docker0: 5555 1 0 0 0 0 0 0 5555 2 0 0 0 0 0 0\n\
             veth9a1b2c: 5555 1 0 0 0 0 0 0 5555 2 0 0 0 0 0 0\n\
                   wg0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+           tailscale0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                  tun0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                  tap0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                 bond0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
@@ -657,6 +727,23 @@ mod tests {
         // ones nobody thinks to list. A block device behind a fuse driver
         // mounts as `fuseblk` and still counts.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
+    }
+
+    /// The hub's install.sh runs this agent with `ProtectHome=yes`, and systemd
+    /// implements that by mounting a tmpfs over /home. Both rows stay in the
+    /// table, but a path resolves to the top one -- so counting the row
+    /// underneath books the tmpfs's size (half of RAM, by default) as the size of
+    /// a filesystem statvfs will never be asked about.
+    #[test]
+    fn a_shadowed_filesystem_is_not_counted_as_the_one_mounted_over_it() {
+        let table = "/dev/vda1 / ext4 rw 0 0\n\
+                     /dev/vdb1 /home ext4 rw 0 0\n\
+                     tmpfs /home tmpfs ro,size=409600k 0 0\n";
+        assert_eq!(parse_mounts(table), vec!["/"]);
+        // And say which one went, or the panel simply disagrees with df.
+        assert_eq!(shadowed_mounts(table), vec!["/home"]);
+        // A point mounted once is not shadowed, however many others there are.
+        assert!(shadowed_mounts("/dev/vda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n").is_empty());
     }
 
     #[test]

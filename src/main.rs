@@ -82,6 +82,17 @@ fn ws_url(server: &str, insecure: bool) -> Result<String> {
         Some(("wss" | "ws", _)) => base.to_owned(),
         _ => format!("{scheme}://{base}"),
     };
+    // RFC 3986 puts userinfo before the host, so the authority
+    // `127.0.0.1:28080@evil.example.com` reads as loopback to anything that splits
+    // at the first colon while the connection goes to whoever owns that name --
+    // past the refusal below, and past `--insecure`, which skips it entirely. The
+    // hub's install.sh carries a copy of the same test and the same hole, and there
+    // the bytes that arrive are `install -m 0755`ed and started as root. Nothing a
+    // hub is reached at needs userinfo, so it is refused rather than parsed.
+    let authority = base.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+    if authority.contains('@') {
+        bail!("server URL must not contain '@': the host is whatever follows it, not what precedes it");
+    }
     if base.starts_with("ws://") && !insecure && !is_loopback(&base) {
         bail!(
             "refusing plaintext ws:// to a remote hub; the token would travel in the clear. \
@@ -98,6 +109,9 @@ fn ws_url(server: &str, insecure: bool) -> Result<String> {
 /// name someone else resolves, and it begins with the loopback net. Anything
 /// that is not a literal loopback address falls to the plaintext refusal --
 /// including `::ffff:127.0.0.1`, which stays behind `--insecure`.
+///
+/// Userinfo never reaches here: `ws_url` refuses an authority carrying `@`, so
+/// the first colon is the port separator and not something inside a userinfo.
 fn is_loopback(url: &str) -> bool {
     let authority = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
     let host = match authority.strip_prefix('[') {
@@ -168,6 +182,14 @@ fn remaining(last_frame: Instant) -> Duration {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
+    // Once, at startup. The hub's install.sh hardens this unit with
+    // ProtectHome=yes, which puts a tmpfs over /home; where /home is its own
+    // filesystem the panel is then short by the whole of it, and the caliber rule
+    // says the numbers have to match df. Nothing here can fix that -- it is the
+    // unit's call -- but it must not be silent.
+    for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
+        eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+    }
     let mut collector = Collector::new();
     let mut wait = 0u64;
 
@@ -352,6 +374,11 @@ fn respawn_ping_tasks(
         let (tx, spawned) = (tx.clone(), task.clone());
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(spawned.interval.clamp(5, 3600)));
+            // Same rule as the report ticker: a probe that overran its interval
+            // must not have the missed ticks fired back to back. Burst -- the
+            // default -- turns one stalled resolution into a handful of connects
+            // with no gap, which is the shape MAX_PING_TASKS is sized against.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
                 let latency = tcp_ping(&spawned.target).await;
@@ -392,7 +419,16 @@ const MAX_PING_ADDRS: usize = 3;
 /// hostname resolves first and connects second, folding the resolver's latency
 /// into every sample.
 async fn tcp_ping(target: &str) -> i32 {
-    let Ok(addresses) = tokio::net::lookup_host(target).await else { return -1 };
+    // Bounded by the same deadline one handshake gets: a resolution that takes
+    // longer than a connect is already useless as a latency sample, and
+    // `lookup_host` has none of its own -- glibc against a black-holed nameserver
+    // is tens of seconds. Aborting the probe task cannot cancel the blocking
+    // getaddrinfo underneath it, so without this a dead resolver leaks one
+    // blocking thread per probe per reconnect.
+    let Ok(Ok(addresses)) = tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host(target)).await
+    else {
+        return -1;
+    };
     handshake(addresses).await
 }
 
@@ -460,6 +496,13 @@ mod tests {
         assert!(ws_url("http://127.attacker.example/", false).is_err());
         // Fail closed: a mapped literal is not read as loopback either.
         assert!(ws_url("http://[::ffff:127.0.0.1]:28080", false).is_err());
+        // Userinfo puts a loopback address where the host test looks and somebody
+        // else's name where the socket goes -- verified against http::Uri, which
+        // resolves this authority's host to evil.example.com. --insecure skips the
+        // plaintext refusal, so the check cannot live inside it.
+        assert!(ws_url("http://127.0.0.1:28080@evil.example.com/", false).is_err());
+        assert!(ws_url("http://127.0.0.1:28080@evil.example.com/", true).is_err());
+        assert!(ws_url("https://hub.example.com@evil.example.com/", false).is_err());
         // No token anywhere in the URL: it rides in a header instead.
         assert!(!ws_url("https://hub.example.com", false).unwrap().contains("token"));
     }
