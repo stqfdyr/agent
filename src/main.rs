@@ -379,9 +379,23 @@ fn respawn_ping_tasks(
             // default -- turns one stalled resolution into a handful of connects
             // with no gap, which is the shape MAX_PING_TASKS is sized against.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Said once per probe per session, not per round: a resolver that
+            // overruns does so every time, and the alternative to one line is
+            // reading it off a chart that now correctly shows nothing.
+            let mut said = false;
             loop {
                 ticker.tick().await;
-                let latency = tcp_ping(&spawned.target).await;
+                let Some(latency) = tcp_ping(&spawned.target).await else {
+                    if !std::mem::replace(&mut said, true) {
+                        eprintln!(
+                            "{}: name resolution runs past {}ms, so these rounds report no sample \
+                             rather than a loss",
+                            spawned.target,
+                            HANDSHAKE_DEADLINE.as_millis()
+                        );
+                    }
+                    continue;
+                };
                 let msg =
                     notify("ping.result", serde_json::json!({"task_id": spawned.id, "latency_ms": latency}));
                 if tx.send(msg).await.is_err() {
@@ -412,24 +426,46 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(900);
 /// and a probe may not outlast the five-second floor on its own interval.
 const MAX_PING_ADDRS: usize = 3;
 
-/// Round trip of a TCP handshake to the target, in milliseconds; -1 when no
-/// address answered inside [`HANDSHAKE_DEADLINE`].
+/// Round trip of a TCP handshake to the target in milliseconds, -1 when no
+/// address answered inside [`HANDSHAKE_DEADLINE`], and `None` when the name
+/// could not be resolved in that time at all.
+///
+/// The last two are not the same answer and must not share one. -1 is the wire
+/// protocol's word for "this target did not answer", and the hub files every
+/// negative reading as a lost packet (`db::close_bucket` folds them into the
+/// bucket's `loss`), so answering it for a slow resolver draws packet loss on a
+/// link that dropped nothing -- on a target that is up. A resolution that
+/// overran is a sample this round did not take, and the hub's own accumulator
+/// already has the rule for that: no reading is not a reading of zero.
 ///
 /// The name is resolved before the clock starts: `TcpStream::connect` on a
 /// hostname resolves first and connects second, folding the resolver's latency
-/// into every sample.
-async fn tcp_ping(target: &str) -> i32 {
+/// into every sample. glibc caches nothing, so this happens every round.
+///
+/// ponytail: the `None` arm has no runtime reproduction here. Forcing it needs
+/// either a resolver that really overruns -- which makes the assertion answer to
+/// the network rather than to this code -- or a deadline parameter that exists
+/// only for the test. What is pinned instead is the shape: the assertions below
+/// spell `Some(-1)`, so collapsing the two answers back into one `i32` fails to
+/// compile.
+async fn tcp_ping(target: &str) -> Option<i32> {
     // Bounded by the same deadline one handshake gets: a resolution that takes
     // longer than a connect is already useless as a latency sample, and
-    // `lookup_host` has none of its own -- glibc against a black-holed nameserver
-    // is tens of seconds. Aborting the probe task cannot cancel the blocking
-    // getaddrinfo underneath it, so without this a dead resolver leaks one
-    // blocking thread per probe per reconnect.
-    let Ok(Ok(addresses)) = tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host(target)).await
-    else {
-        return -1;
+    // `lookup_host` has none of its own -- glibc against a black-holed
+    // nameserver is tens of seconds.
+    //
+    // It does not cancel the `getaddrinfo` underneath: that sits on a blocking
+    // thread and finishes on its own schedule whatever happens here. What the
+    // deadline buys is that this probe keeps its cadence instead of stalling
+    // for the resolver's whole retry schedule -- not a thread that stops being
+    // occupied.
+    let Ok(resolved) = tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host(target)).await else {
+        return None;
     };
-    handshake(addresses).await
+    // A name that resolves to an error is a target nothing can reach, which is
+    // what -1 says. Only the deadline above is ambiguous.
+    let Ok(addresses) = resolved else { return Some(-1) };
+    Some(handshake(addresses).await)
 }
 
 /// The first address that completes a handshake, in milliseconds.
@@ -531,11 +567,13 @@ mod tests {
         // is 0 whether it is timed or not. What it pins is the contract either
         // side: reachable is non-negative, unreachable is -1. That the number
         // is a real round trip rests on the deadline test below.
-        assert!(tcp_ping(&addr.to_string()).await >= 0);
-        assert_eq!(tcp_ping("127.0.0.1:1").await, -1, "nothing is listening there");
-        // A target that will not resolve comes back unreachable rather than
-        // taking the probe down.
-        assert_eq!(tcp_ping("127.0.0.1:99999").await, -1, "not a parseable target");
+        assert!(tcp_ping(&addr.to_string()).await.unwrap() >= 0);
+        assert_eq!(tcp_ping("127.0.0.1:1").await, Some(-1), "nothing is listening there");
+        // Resolution that fails is still an unreachable target, not a missing
+        // sample -- the branch that has to stay -1 now that overrunning the
+        // deadline does not. std refuses this port before it reaches the
+        // resolver, so the assertion holds with no network under it.
+        assert_eq!(tcp_ping("127.0.0.1:99999").await, Some(-1), "an unresolvable target is unreachable");
 
         // A name whose first address is dead: the shape of a dual-stack target
         // on a box whose v6 goes nowhere. The probe moves on instead of
