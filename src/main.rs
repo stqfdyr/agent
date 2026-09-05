@@ -2,7 +2,12 @@
 
 mod collect;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// The same clock `tokio::time::timeout` and `sleep` read, so the deadline
+// arithmetic below cannot drift from the timers enforcing it -- and a test can
+// move it. Outside a paused runtime this is the monotonic clock either way.
+use tokio::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -149,6 +154,16 @@ async fn send(
         .context("write")
 }
 
+/// What is left of the silence budget, counted from the last sign of life.
+///
+/// One function so every write asks the same question. The hello used to be
+/// handed a bare [`HUB_SILENCE`] instead, and the clock only started after it
+/// returned -- so a slow hello spent its own 90 seconds and then gave the
+/// watchdog a fresh 90, which is the sum this budget exists to rule out.
+fn remaining(last_frame: Instant) -> Duration {
+    HUB_SILENCE.saturating_sub(last_frame.elapsed())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = parse_args()?;
@@ -237,33 +252,36 @@ async fn session(
         .context("connect")?;
     eprintln!("connected");
     *connected = Some(Instant::now());
+    // The clock starts at the handshake, and the hello below spends from it
+    // like every other write. Started after that send instead, hello got a
+    // full HUB_SILENCE of its own and the watchdog a second one -- the 90 + 90
+    // this deadline is shared to prevent, landing past the 120s at which the
+    // hub gives up on a quiet agent.
+    let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?), HUB_SILENCE).await?;
+    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_frame = Instant::now();
 
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
-                let budget = HUB_SILENCE.saturating_sub(last_frame.elapsed());
-                if let Err(e) = send(&mut ws, notify("report", m), budget).await { break Err(e); }
+                if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
             }
             // Built afresh each pass from the last frame, so silence costs
             // exactly HUB_SILENCE. A timer polled every HUB_SILENCE / 3 spent
             // a whole extra tick before firing, which put the worst case at
             // the hub's own timeout instead of under it. Not the report tick:
             // --interval can stretch that to an hour.
-            _ = tokio::time::sleep(HUB_SILENCE.saturating_sub(last_frame.elapsed())) => {
+            _ = tokio::time::sleep(remaining(last_frame)) => {
                 break Err(anyhow!("no frame from the hub in {}s", HUB_SILENCE.as_secs()));
             }
             Some(msg) = result_rx.recv() => {
-                let budget = HUB_SILENCE.saturating_sub(last_frame.elapsed());
-                if let Err(e) = send(&mut ws, msg, budget).await { break Err(e); }
+                if let Err(e) = send(&mut ws, msg, remaining(last_frame)).await { break Err(e); }
             }
             incoming = ws.next() => {
                 // Any frame proves the path is still there, the hub's
@@ -513,11 +531,10 @@ mod tests {
     /// While the watchdog was an interval polled every HUB_SILENCE / 3, the
     /// worst case was 90 + 30 = 120s -- the hub's timeout exactly.
     ///
-    /// Neither of those two structures is asserted here, and putting either
-    /// back leaves this file green: proving it takes a paused clock and a
-    /// socket that accepts nothing, which is more scaffolding than the two
-    /// lines it would guard. What holds them is that both read their deadline
-    /// from `last_frame` rather than keeping a clock of their own.
+    /// The two structures behind that are asserted below rather than here.
+    /// This file used to say they were not worth the scaffolding -- a paused
+    /// clock and a socket that accepts nothing -- and while it said so, the
+    /// hello write went back to a budget of its own and nothing went red.
     #[test]
     fn the_agent_gives_up_on_a_silent_hub_before_the_hub_gives_up_on_it() {
         assert!(
@@ -525,6 +542,71 @@ mod tests {
             "past the hub's own timeout the agent stops being what recovers the connection"
         );
         assert!(HUB_SILENCE > Duration::from_secs(60), "two lost heartbeats are a blip, not a dead link");
+    }
+
+    /// A sink that accepts nothing, ever: the socket whose peer has stopped
+    /// reading, which is the only case the write deadline exists for.
+    struct NeverDrains;
+
+    impl Sink<Message> for NeverDrains {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), WsError>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+            unreachable!("never ready")
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), WsError>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), WsError>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Every write spends from one clock started at the handshake, so a session
+    /// gives up exactly HUB_SILENCE after its last sign of life however many
+    /// writes stalled in between. The hello is the first of those writes: given
+    /// a fresh budget and a clock that only started afterwards, a slow one
+    /// pushed the give-up point to 175s, past the 120s at which the hub has
+    /// already dropped the node.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_hello_cannot_push_the_give_up_point_past_the_hubs_own_timeout() {
+        let handshake = Instant::now();
+        assert_eq!(remaining(handshake), HUB_SILENCE, "the first write gets the whole budget");
+
+        // A hello that stalls: it must fail at the budget it was handed, not
+        // at one of its own.
+        assert!(send(&mut NeverDrains, notify("hello", serde_json::json!({})), remaining(handshake))
+            .await
+            .is_err());
+        assert_eq!(handshake.elapsed(), HUB_SILENCE, "the stall costs the budget, no more");
+
+        // And whatever a session does afterwards, the give-up moment stays put
+        // at last_frame + HUB_SILENCE: what is spent plus what is left is that
+        // one window, never a second one.
+        for spent in [0, 30, 89, 90, 200] {
+            let last_frame = Instant::now();
+            tokio::time::advance(Duration::from_secs(spent)).await;
+            assert_eq!(
+                last_frame.elapsed() + remaining(last_frame),
+                HUB_SILENCE.max(last_frame.elapsed()),
+                "{spent}s in, the budget must not push the deadline out"
+            );
+        }
     }
 
     #[test]
